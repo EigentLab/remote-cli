@@ -236,3 +236,24 @@ async fn another_os_user_cannot_control_the_local_device() {
         assert!(err.to_string().contains("Device Owner"), "{err}");
     }
 }
+
+/// Service Mode: the user logged in at the Device's screen controls the Local Device, and makes no owner change.
+#[cfg(unix)]
+#[tokio::test]
+async fn the_user_at_the_screen_controls_the_local_device_in_service_mode() {
+    use std::os::unix::fs::MetadataExt;
+    let dir = temp_dir("local-console-user");
+    let socket = dir.join("agent.sock");
+    let secrets = std::sync::Arc::new(rcli_agent::secret_store::FileSecretStore::new(dir.clone()));
+    let status = rcli_agent::ipc::Status::new("", rcli_agent::ServerAccess { addr: String::new(), server_key: String::new() }, secrets);
+    status.set_platform(std::sync::Arc::new(rcli_testkit::FakePlatform::new("laptop")));
+    let me = std::fs::metadata(&dir).unwrap().uid();
+    tokio::spawn(rcli_agent::ipc::serve_at_the_console_of(socket.clone(), std::sync::Arc::new(status), me));
+    eventually(|| async { socket.exists().then_some(()) }).await;
+
+    local_rcli(&dir, &socket, &["shot", "local", "--out", dir.to_str().unwrap()]).await.unwrap();
+    if !rcli_testkit::running_as_root() {
+        let err = rcli_agent::ipc::send(&socket, &rcli_agent::ipc::Request::PasswordShow).await.unwrap_err();
+        assert!(err.to_string().contains("Device Owner"), "{err}");
+    }
+}

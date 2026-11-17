@@ -100,7 +100,7 @@ fn peer_uid(stream: &UnixStream) -> Option<u32> {
 
 /// macOS: the user logged in on the console: the owner of `/dev/console` (root at the login window).
 #[cfg(target_os = "macos")]
-fn console_uid() -> Option<u32> {
+pub(crate) fn console_uid() -> Option<u32> {
     std::os::unix::fs::MetadataExt::uid(&std::fs::metadata("/dev/console").ok()?).into()
 }
 

@@ -887,6 +887,18 @@ fn session_flags() -> Option<impl Fn(&str) -> bool> {
     })
 }
 
+/// Keeps this process out of the Dock. The session helper runs from the app's bundle, so its first screen call made it
+/// an app there, shown as "Not Responding" because it runs no event loop.
+pub fn stay_out_of_the_dock() {
+    #[link(name = "AppKit", kind = "framework")]
+    extern "C" {}
+    unsafe {
+        let app: *mut objc2::runtime::AnyObject = objc2::msg_send![objc2::class!(NSApplication), sharedApplication];
+        // NSApplicationActivationPolicyProhibited
+        let _: bool = objc2::msg_send![app, setActivationPolicy: 2isize];
+    }
+}
+
 /// Whether this process's GUI session is the one on the console (not a fast-user-switched one in the background).
 /// The login window has no session dictionary and is always on the console.
 pub fn on_console() -> bool {

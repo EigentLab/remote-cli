@@ -249,6 +249,11 @@ pub fn console_uid(run: &dyn Fn(&[&str]) -> Option<String>) -> Option<u32> {
     seat_session(run).and_then(|s| s.uid)
 }
 
+/// The user logged in on the console; None at a greeter (the login screen).
+pub fn console_user_uid() -> Option<u32> {
+    seat_session(&loginctl).filter(|s| !s.is_greeter()).and_then(|s| s.uid)
+}
+
 /// The graphical session on the console that a helper (or the GUI window) can be put into, if any.
 fn target_at(root: &Path, loginctl: &dyn Fn(&[&str]) -> Option<String>) -> Option<Target> {
     let session = seat_session(loginctl)?;

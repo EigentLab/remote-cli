@@ -24,7 +24,7 @@ description: Drive the `rcli` CLI. Use when asked to see, click or type on a rem
 
 ## The Local Device
 
-`local` as `<dev>` is the machine `rcli` is installed on: `shot`, `act` and `batch` go straight to its running Agent, with no Server, no `connect` and no lock bracket. It works only for the Device Owner (the OS user running the Agent) or root; anyone else, and every other command, uses the Device ID like for a remote Device.
+`local` as `<dev>` is the machine `rcli` is installed on: `shot`, `act` and `batch` go straight to its running Agent, with no Server, no `connect` and no lock bracket. It works only for the Device Owner (the OS user running the Agent, or root) and, in Service Mode, the user logged in at the Device's screen; anyone else, and every other command, uses the Device ID like for a remote Device.
 
 ## Recipes
 

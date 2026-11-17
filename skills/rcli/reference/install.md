@@ -9,6 +9,7 @@ These run on the machine itself, not through the Server API. Every write command
 | Installed by | `rcli install` as a normal user | `rcli install` as root/Administrator, the install packages, or `rcli service install` |
 | Runs as | that user, from login to logout | root/SYSTEM, from boot |
 | Device Owner (may change Device Settings) | that user | root/Administrator |
+| `local` (`shot`, `act`, `batch`) | that user | root, and the user logged in at the screen |
 | Lock and login screens, `--as root`, another Terminal User | refused with `service_mode_required` | available |
 
 ## Install lifecycle

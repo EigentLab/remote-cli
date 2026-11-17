@@ -196,6 +196,8 @@ enum Caller {
     Other,
     /// The OS user the Agent runs as (User Mode), not root.
     Owner,
+    /// Service Mode: the user logged in at the Device's screen. They control the Local Device, nothing else.
+    Console,
     Root,
 }
 
@@ -668,18 +670,48 @@ pub fn token_user_sid(token: windows::Win32::Foundation::HANDLE) -> Option<Strin
 /// Mode), or root. `info` is for any local user.
 #[cfg(unix)]
 pub async fn serve(path: PathBuf, status: Arc<Status>) -> anyhow::Result<()> {
-    serve_owned_by(path, status, unsafe { libc::geteuid() }).await
+    let me = unsafe { libc::geteuid() };
+    // Read at each request: the user at the screen changes while the root Agent runs.
+    serve_for(path, status, me, move || console_uid().filter(|_| me == 0)).await
 }
 
 /// `serve` with the Device Owner's uid given: tests stand in another OS user than the one they run as.
 #[cfg(unix)]
 pub async fn serve_owned_by(path: PathBuf, status: Arc<Status>, owner: u32) -> anyhow::Result<()> {
+    serve_for(path, status, owner, || None).await
+}
+
+/// `serve` as a Service Mode Agent with `console` logged in at the Device's screen: tests cannot run as root.
+#[cfg(unix)]
+pub async fn serve_at_the_console_of(path: PathBuf, status: Arc<Status>, console: u32) -> anyhow::Result<()> {
+    serve_for(path, status, 0, move || Some(console)).await
+}
+
+#[cfg(unix)]
+async fn serve_for(path: PathBuf, status: Arc<Status>, owner: u32, console: impl Fn() -> Option<u32> + Send + Sync + 'static) -> anyhow::Result<()> {
     serve_with(path, status, move |stream| match stream.peer_cred().map(|c| c.uid()) {
         Ok(0) => Caller::Root,
         Ok(uid) if uid == owner => Caller::Owner,
+        Ok(uid) if console() == Some(uid) => Caller::Console,
         _ => Caller::Other,
     })
     .await
+}
+
+/// The user logged in at the Device's screen; None at the login screen.
+#[cfg(target_os = "macos")]
+fn console_uid() -> Option<u32> {
+    crate::macos_session::console_uid()
+}
+
+#[cfg(target_os = "linux")]
+fn console_uid() -> Option<u32> {
+    crate::linux::session::console_user_uid()
+}
+
+#[cfg(all(unix, not(any(target_os = "macos", target_os = "linux"))))]
+fn console_uid() -> Option<u32> {
+    None
 }
 
 /// Tests run unprivileged: this stands in for "the caller is root", nothing else.
@@ -731,6 +763,8 @@ pub async fn serve_trusting_all(path: PathBuf, status: Arc<Status>) -> anyhow::R
 async fn serve_windows(path: PathBuf, status: Arc<Status>, trust_all: bool) -> anyhow::Result<()> {
     let mut server = pipe_server(&path, true)?;
     let me = process_user_sid(None);
+    // Service Mode: the Agent is the SYSTEM service.
+    let service = me.as_deref() == Some("S-1-5-18");
     loop {
         server.connect().await?;
         let client = std::mem::replace(&mut server, pipe_server(&path, false)?);
@@ -738,6 +772,7 @@ async fn serve_windows(path: PathBuf, status: Arc<Status>, trust_all: bool) -> a
         let caller = match () {
             _ if trust_all || client_is_elevated(&client) => Caller::Root,
             _ if same_user() => Caller::Owner,
+            _ if service && client_pid(&client).is_some_and(crate::windows_session::in_console_session) => Caller::Console,
             _ => Caller::Other,
         };
         let status = status.clone();
@@ -827,7 +862,10 @@ where
             Ok(()) => dispatch(&status, &request, true).await,
             Err(e) => json!({ "error": e }),
         },
-        false => dispatch(&status, &request, caller == Caller::Root).await,
+        false => {
+            let local = caller == Caller::Console && matches!(serde_json::from_value::<Request>(request.clone()), Ok(Request::Act { .. }));
+            dispatch(&status, &request, caller == Caller::Root || local).await
+        }
     };
     write.write_all(format!("{reply}\n").as_bytes()).await?;
     write.flush().await?;
@@ -933,7 +971,7 @@ async fn dispatch(status: &Status, request: &Value, is_root: bool) -> Value {
         // Local control is the Device Owner's own screen: no Server, password, Control Lock or Session Window, and
         // never the OS password (decision 14), so it is answered here, before the owner changes.
         Request::Act { .. } if !is_root => {
-            json!({ "error": "controlling the Local Device requires the Device Owner, the OS user running the Agent, or root" })
+            json!({ "error": "controlling the Local Device requires the Device Owner (the OS user running the Agent, or root) or, in Service Mode, the user logged in at its screen" })
         }
         Request::Act { body } => local_act(status, body).await,
         _ if !is_root => {

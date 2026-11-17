@@ -914,7 +914,7 @@ async fn switch(to_service: bool, root: Option<&std::path::Path>, out: &mut dyn 
     let name = String::from_utf8(std::process::Command::new("/bin/hostname").arg("-s").output()?.stdout)?.trim().to_owned();
     let Some(root) = root else {
         let owner = crate::install::Owner::from_sudo()?;
-        let user = UserLayout { home: owner.home.clone(), config_dir: owner.home.join("Library/Application Support/rcli") };
+        let user = UserLayout { home: owner.home.clone(), config_dir: owner.home.join("Library/Application Support").join(crate::config::MACOS_DIR) };
         let layout = Layout { root: "/".into() };
         let platform = rcli_agent::macos::MacPlatform::new(name.clone())?;
         let (run, console) = (&mut crate::install::system, crate::macos_install::console_uid());
@@ -979,6 +979,7 @@ impl Session {
         let _ = tracing_subscriber::fmt().try_init();
         let socket = self.socket.ok_or_else(|| anyhow::anyhow!("--socket is required on macOS"))?;
         let platform = rcli_agent::macos::MacPlatform::new("session")?;
+        rcli_agent::macos::stay_out_of_the_dock();
         tokio::task::spawn_blocking(move || rcli_agent::macos_session::run_helper(&socket, &platform, &rcli_agent::macos::on_console))
             .await?
     }
