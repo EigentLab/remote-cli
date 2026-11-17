@@ -1,8 +1,6 @@
 <p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="assets/icons/readme-header-dark.png">
-    <img src="assets/icons/readme-header.png" alt="rcli" width="228">
-  </picture>
+  <img src="assets/icons/readme-header.png#gh-light-mode-only" alt="rcli" width="228">
+  <img src="assets/icons/readme-header-dark.png#gh-dark-mode-only" alt="rcli" width="228">
 </p>
 
 <p align="center"><b>Remote control for AI agents and scripts.</b><br>
