@@ -19,11 +19,11 @@ You do not need a Server to try rcli. Install it for your own user, then drive t
 
 ```bash
 rcli install                          # User Mode: no root, starts at login; without --server it serves only local control
-rcli shot local --marks               # a screenshot of this machine, with numbered Marks
+rcli shot local --marks               # a screenshot of the Local Device, with numbered Marks
 rcli act local click --text "OK"      # click the Mark labelled OK
 ```
 
-`local` stands in for a Device ID and goes through the Agent running on this machine. It needs no Server, no Device Password and no Control Lock. Only the Device Owner (the OS user running the Agent) or root may use it. On macOS, first allow rcli Screen Recording and Accessibility (see [macOS](/en/devices/#macos)).
+`local` stands in for a Device ID and goes through the Agent running on the Local Device. It needs no Server, no Device Password and no Control Lock. Only the Device Owner (the OS user running the Agent) or root may use it. On macOS, first allow rcli Screen Recording and Accessibility (see [macOS](/en/devices/#macos)).
 
 ## Install rcli and connect to a Device
 
@@ -221,12 +221,12 @@ rcli server-address set rcli.example.com:9443 # reissues the Agent port's TLS ce
 rcli api-address show                         # the API Address
 rcli api-address set https://rcli.example.com # correct it; Agents get it on their next connection
 rcli build list                               # Agent Builds, newest first, the Latest Build marked
-rcli build upload ./rcli-1.0.0-linux-x86_64 --version 1.0.0 --target linux-x86_64   # the Server computes the sha256
-rcli build delete 1.0.0 linux-x86_64          # without a target, deletes every target of that version
-rcli package publish rcli_1.0.0_amd64.deb --arch x86_64   # a .dmg, .deb or .rpm for the Connect Guide's downloads
+rcli build upload ./rcli-1.0.1-linux-x86_64 --version 1.0.1 --target linux-x86_64   # the Server computes the sha256
+rcli build delete 1.0.1 linux-x86_64          # without a target, deletes every target of that version
+rcli package publish rcli_1.0.1_amd64.deb --arch x86_64   # a .dmg, .deb or .rpm for the Connect Guide's downloads
 ```
 
-To update a machine to the Latest Build for its OS and architecture (on a Service Mode Device, with `sudo` or as Administrator, so the Agent service is restarted too):
+To update a Device to the Latest Build for its OS and architecture (on a Service Mode Device, with `sudo` or as Administrator, so the Agent service is restarted too):
 
 ```bash
 sudo rcli update

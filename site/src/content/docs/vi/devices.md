@@ -121,8 +121,8 @@ Mở file `.dmg`, kéo `rcli` vào Applications rồi mở nó. Bản dựng ch�
 ### Service Mode
 
 ```bash
-chmod +x rcli-1.0.0-linux-x86_64
-sudo ./rcli-1.0.0-linux-x86_64 install --server rcli.example.com:9443 --key rk_<fingerprint>_<secret>
+chmod +x rcli-1.0.1-linux-x86_64
+sudo ./rcli-1.0.1-linux-x86_64 install --server rcli.example.com:9443 --key rk_<fingerprint>_<secret>
 ```
 
 ```text
@@ -161,7 +161,7 @@ RCLI_SERVER_KEY=rk_<fingerprint>_<secret>
 # RCLI_TERMINAL_USER=alice
 # RCLI_ALLOW_ROOT=1
 CONF
-sudo apt install ./rcli_1.0.0_amd64.deb
+sudo apt install ./rcli_1.0.1_amd64.deb
 systemctl status rcli-agent.service --no-pager
 ```
 

@@ -1,6 +1,6 @@
 ---
 title: Giới hạn đã biết
-description: Những gì rcli 1.0.0 chưa làm, hoặc chỉ làm một phần.
+description: Những gì rcli 1.0.1 chưa làm, hoặc chỉ làm một phần.
 sidebar:
   order: 5
 ---

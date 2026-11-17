@@ -221,9 +221,9 @@ rcli server-address set rcli.example.com:9443 # cấp lại chứng chỉ TLS c�
 rcli api-address show                         # API Address
 rcli api-address set https://rcli.example.com # sửa API Address; Agent nhận ở lần kết nối sau
 rcli build list                               # Agent Build, mới nhất trước, đánh dấu Latest Build
-rcli build upload ./rcli-1.0.0-linux-x86_64 --version 1.0.0 --target linux-x86_64   # Server tự tính sha256
-rcli build delete 1.0.0 linux-x86_64          # bỏ target thì xoá mọi target của phiên bản đó
-rcli package publish rcli_1.0.0_amd64.deb --arch x86_64   # .dmg, .deb hoặc .rpm cho mục Tải xuống của Hướng dẫn kết nối
+rcli build upload ./rcli-1.0.1-linux-x86_64 --version 1.0.1 --target linux-x86_64   # Server tự tính sha256
+rcli build delete 1.0.1 linux-x86_64          # bỏ target thì xoá mọi target của phiên bản đó
+rcli package publish rcli_1.0.1_amd64.deb --arch x86_64   # .dmg, .deb hoặc .rpm cho mục Tải xuống của Hướng dẫn kết nối
 ```
 
 Cập nhật một máy lên Latest Build của OS và kiến trúc của nó (trên Device Service Mode thì chạy bằng `sudo` hoặc Administrator để Agent service cũng được restart):

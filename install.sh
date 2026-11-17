@@ -10,7 +10,7 @@
 # switches to it and keeps the data and the Users.
 set -eu
 
-VERSION=1.0.0
+VERSION=1.0.1
 DIR=${RCLI_ROOT:-}/opt/rcli # RCLI_ROOT: a temporary root for scripts/install-test.sh
 DOCS=https://rcli.eigentlab.com
 USAGE="usage: install.sh [mode]. The five modes:
@@ -100,6 +100,11 @@ EOF
     [in]/*) die "this Server is in $prev mode. $USAGE" ;;
   esac
   mode=${mode:-${prev:-ip}}
+  # The last mode's files are set aside: this mode writes what it needs. A mode that refuses its arguments puts them
+  # and .env back, so the installed Server stays as it was.
+  rm -rf .last && mkdir .last && cp .env .last/
+  for f in compose.override.yaml Caddyfile tls; do [ ! -e "$f" ] || mv "$f" .last/; done
+  trap 'rm -rf compose.override.yaml Caddyfile tls; mv .last/.env .; mv .last/* . 2> /dev/null || true; rm -rf .last' EXIT
   set_env RCLI_VERSION "$VERSION"
   # Every mode keeps the Dashboard on loopback unless .env says otherwise: this script calls the API there, and a
   # proxy is always in front. The ports set in .env stay.
@@ -110,9 +115,10 @@ EOF
   agent_port=$(env_get RCLI_AGENT_PORT)
   agent_port=${agent_port:-9443}
   write_compose
-  rm -rf compose.override.yaml Caddyfile tls # the last mode's; this one writes what it needs
-  url= open= note=
+  url= open= note= moved=
   "mode_$mode"
+  trap - EXIT
+  rm -rf .last
   set_env RCLI_MODE "$mode"
   # The Server applies it at its start when it changed, so a switch works after the bootstrap token has stopped
   # working; empty: learned from the first https sign-in through the tunnel or proxy.
@@ -122,10 +128,11 @@ EOF
   echo "Waiting for the Server to start"
   wait_for curl -fs "$API/server-ca"
   password=
-  # The bootstrap token works until a User signs in to the Dashboard; then the Users are theirs.
-  if users=$(api "$API/users" 2> /dev/null) && [ "$users" = "[]" ]; then
+  # The bootstrap token works until a User signs in to the Dashboard; then the Users are theirs. Until then every run
+  # sets admin's password again: a run that failed half way may have left admin without one.
+  if api "$API/users" > /dev/null 2>&1; then
     password=$(LC_ALL=C tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 20)
-    echo '{"name":"admin"}' | api -X POST -d @- "$API/users" > /dev/null
+    echo '{"name":"admin"}' | api -X POST -d @- "$API/users" > /dev/null 2>&1 || true # admin is there after an earlier run
     printf '{"password":"%s"}' "$password" | api -X POST -d @- "$API/users/admin/credentials" > /dev/null
   fi
   # Caddy loads the Caddyfile and certificate files at its start only, and the Server writes its CA's at its own.
@@ -155,6 +162,10 @@ The browser warns about the certificate until you import the Server's CA, $url/a
 EOF
   [ -n "$url" ] || echo "The API Address is learned at the first sign-in through it; check it on the Server Settings page."
   [ "$mode" != domain ] || echo "Caddy gets the certificate once $domain points at this machine and ports 80 and 443 are open."
+  [ -z "$moved" ] || cat << EOF
+The Server Address moved from $moved to $(env_get RCLI_AGENT_HOSTNAMES). Installed Agents keep the old one and are
+offline until you run on each Device: sudo rcli agent server set $(env_get RCLI_AGENT_HOSTNAMES) --key <Server Key>
+EOF
   cat << EOF
 Open these ports: ${open}$agent_port/tcp (Agents), 3478/tcp and 3478/udp, 49160-49200/udp (TURN relay).
 Back up $DIR/.env: its RCLI_MASTER_KEY seals the Server's CA, and the database cannot be used without it.
@@ -178,6 +189,8 @@ ip_address() {
 # change on the Server Settings page stands until a run gives another address.
 agent_host() {
   set_env RCLI_TURN_HOST "$1"
+  moved=$(env_get RCLI_AGENT_HOSTNAMES)
+  [ "$moved" != "$1:$agent_port" ] || moved=
   set_env RCLI_AGENT_HOSTNAMES "$1:$agent_port"
 }
 

@@ -18,7 +18,7 @@ stub curl "echo \"curl \$*\" >> '$t/log'
 case \"\$*\" in
   *server-ca*) printf -- '-----BEGIN CERTIFICATE-----\nAAEC\n-----END CERTIFICATE-----\n' ;;
   *'-X POST'*/users) cat > /dev/null; echo '[{\"name\":\"admin\"}]' > '$t/users' ;;
-  */users) cat '$t/users' ;;
+  */users) [ ! -e '$t/signed-in' ] || exit 22; cat '$t/users' ;; # the bootstrap token stops at the first sign-in
   *) echo \"\$* <<< \$(cat)\" >> '$t/log' ;;
 esac"
 run() { PATH="$t/bin:$PATH" RCLI_ROOT="$t/root" sh install.sh "$@" < /dev/null > "$t/out" 2>&1 || { cat "$t/out"; fail "install.sh $* failed"; }; }
@@ -41,6 +41,12 @@ grep -q 'Name: *admin' "$t/out" || fail "name not printed"
 password=$(sed -n 's/.*Password: *\([A-Za-z0-9]\{16,\}\).*/\1/p' "$t/out")
 [ -n "$password" ] || fail "password not printed"
 ! grep -rq "$password" "$t/root" || fail "password written to disk"
+! grep -q 'Server Address moved' "$t/out" || fail "first run warned of a moved Server Address"
+
+# Until a User signs in, a run sets admin's password again: a first run that failed half way left admin without one.
+run
+grep -q 'Password: *[A-Za-z0-9]\{16,\}' "$t/out" && ! grep -q "$password" "$t/out" || fail "admin's password not set again before a sign-in"
+touch "$t/signed-in"
 
 cp "$dir/.env" "$t/env1"
 sed -i.bak "s/^RCLI_VERSION=.*/RCLI_VERSION=0.9.0/" "$dir/.env" && rm "$dir/.env.bak"
@@ -58,13 +64,19 @@ grep -q 'docker compose up' "$t/log" || fail "second run did not restart the sta
 grep -q '^RCLI_API_ADDRESS=https://198.51.100.4:4443$' "$dir/.env" || fail "--ip did not move the API Address"
 grep -q '^RCLI_AGENT_HOSTNAMES=198.51.100.4:9443$' "$dir/.env" || fail "--ip did not move the Server Address"
 
-# The other modes, each a switch on the installed Server: only how the Dashboard is served changes.
+grep -q 'agent server set 198.51.100.4:9443' "$t/out" || fail "--ip: no warning that the Server Address moved"
+
+# The other modes, each a switch on the installed Server: the secrets and the Users stay.
 mode() { grep -q "^RCLI_MODE=$1$" "$dir/.env" || fail "not in $1 mode"; grep -q '^RCLI_DASHBOARD_PORT=127.0.0.1:3080$' "$dir/.env" || fail "Dashboard published beyond loopback"; }
 run --domain rcli.example.com
 mode domain
 grep -q '^RCLI_API_ADDRESS=https://rcli.example.com$' "$dir/.env" || fail "domain: API Address"
 grep -q '^rcli.example.com {' "$dir/Caddyfile" && grep -q '"443:443"' "$dir/compose.override.yaml" || fail "domain: Caddy on 443"
 ! grep -q 'RCLI_HTTPS_CERT_FILE' "$dir/compose.override.yaml" || fail "domain: still the CA certificate"
+grep -q 'agent server set rcli.example.com:9443' "$t/out" || fail "domain: no warning that the Server Address moved"
+cp "$dir/.env" "$t/env2"
+PATH="$t/bin:$PATH" RCLI_ROOT="$t/root" sh install.sh --domain other.example.com --cert "$t/none" --key "$t/none" < /dev/null > "$t/out" 2>&1 && fail "accepted a missing certificate"
+cmp -s "$t/env2" "$dir/.env" && grep -q '^rcli.example.com {' "$dir/Caddyfile" && [ ! -e "$dir/.last" ] || fail "a refused run changed the installed Server"
 echo cert > "$t/c.pem" && echo key > "$t/k.pem"
 run --domain rcli.example.com --cert "$t/c.pem" --key "$t/k.pem"
 mode cert
@@ -109,7 +121,7 @@ run
 grep -q '^RCLI_DASHBOARD_PORT=127.0.0.1:4080$' "$dir/.env" && grep -q '^RCLI_AGENT_PORT=9555$' "$dir/.env" || fail "ports in .env not kept"
 grep -q '^RCLI_AGENT_HOSTNAMES=198.51.100.4:9555$' "$dir/.env" || fail "Server Address not on RCLI_AGENT_PORT"
 grep -q 'http://127.0.0.1:4080/api/v1/server-ca' "$t/log" || fail "API not called on RCLI_DASHBOARD_PORT"
-grep -q '9555/tcp (Agents)' "$t/out" && grep -q '127.0.0.1:4080' "$t/out" && ! grep -q '9443\|3080' "$t/out" || fail "printed ports not the .env ones"
+grep -q '9555/tcp (Agents)' "$t/out" && grep -q '127.0.0.1:4080' "$t/out" && ! grep -v 'Server Address moved' "$t/out" | grep -q '9443\|3080' || fail "printed ports not the .env ones"
 
 stub uname 'echo Darwin'
 PATH="$t/bin:$PATH" RCLI_ROOT="$t/root2" sh install.sh < /dev/null > "$t/out" 2>&1 && fail "installed on macOS"

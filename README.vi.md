@@ -88,6 +88,14 @@ claude mcp add rcli -- rcli mcp
 
 `rcli mcp` dùng cấu hình của bản cài và các Device Password bạn đã lưu khi `rcli connect`, nên không cần thiết lập gì thêm. Các tool gồm `devices`, `device`, `lock_acquire`, `lock_release`, `lock_status`, `observe`, `act`, `batch`, `exec`, `wake` và `power`; ảnh màn hình trả về trực tiếp kèm bảng Mark. `device: "local"` điều khiển Local Device. Rồi nhờ Claude Code, chẳng hạn: *"Cài các bản cập nhật đang chờ trên demo-pc."*
 
+## Skill cho AI agent
+
+`skills/rcli/` dạy agent dùng CLI `rcli`: các quy tắc (Control Lock, bí mật, việc gì phải hỏi trước), công thức và bảng tra lệnh. Với Claude Code:
+
+```bash
+cp -R skills/rcli ~/.claude/skills/
+```
+
 ## Build từ mã nguồn
 
 ```bash
