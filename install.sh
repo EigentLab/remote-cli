@@ -10,7 +10,7 @@
 # switches to it and keeps the data and the Users.
 set -eu
 
-VERSION=1.0.1
+VERSION=1.0.3
 DIR=${RCLI_ROOT:-}/opt/rcli # RCLI_ROOT: a temporary root for scripts/install-test.sh
 DOCS=https://rcli.eigentlab.com
 USAGE="usage: install.sh [mode]. The five modes:

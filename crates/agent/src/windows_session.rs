@@ -196,6 +196,15 @@ struct Target {
     user: String,
 }
 
+/// Whether process `pid` runs in the session shown on the Device's screen.
+// shortcut: a process another account started in that session (`runas`) counts too; compare the token's user with
+// the session's if that matters.
+pub(crate) fn in_console_session(pid: u32) -> bool {
+    let mut session = 0;
+    unsafe { windows::Win32::System::RemoteDesktop::ProcessIdToSessionId(pid, &mut session) }.is_ok()
+        && session == unsafe { WTSGetActiveConsoleSessionId() }
+}
+
 fn console_target() -> Option<Target> {
     let session = unsafe { WTSGetActiveConsoleSessionId() };
     // 0xFFFFFFFF: there is no console session at all (a Server Core box, or a Device still booting).

@@ -118,12 +118,43 @@ pub fn dir() -> PathBuf {
     platform_dir()
 }
 
+/// macOS: the config directory's name in `~/Library/Application Support`, beside the User Mode Agent's `rcli`.
+pub const MACOS_DIR: &str = "rcli-controller";
+
+/// Up to 1.0.1 the Controller's files were in the macOS User Mode Agent's state directory, which a switch to Service
+/// Mode and `rcli uninstall` delete: moves them to `new`, once.
+#[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
+fn move_from_agent_dir(old: &Path, new: &Path) {
+    let files = ["config.json", "passwords", "root", CONTROLLER_FILE].map(|f| (old.join(f), new.join(f)));
+    if new.exists() || !files.iter().any(|(from, _)| from.exists()) || std::fs::create_dir_all(new).is_err() {
+        return;
+    }
+    #[cfg(unix)]
+    let _ = std::fs::set_permissions(new, std::os::unix::fs::PermissionsExt::from_mode(0o700));
+    for (from, to) in files {
+        let _ = std::fs::rename(from, to);
+    }
+}
+
 /// The platform's standard per-user config directory.
 fn platform_dir() -> PathBuf {
     #[cfg(target_os = "windows")]
     return std::env::var_os("APPDATA").map(PathBuf::from).unwrap_or_default().join("rcli");
     #[cfg(target_os = "macos")]
-    return std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default().join("Library/Application Support/rcli");
+    return {
+        static DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+        DIR.get_or_init(|| {
+            // `sudo` keeps the caller's HOME: root uses its own, so it leaves no root-owned files in a user's home.
+            let home = match crate::upgrade::is_root() {
+                true => PathBuf::from("/var/root"),
+                false => std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default(),
+            };
+            let dir = home.join("Library/Application Support").join(MACOS_DIR);
+            move_from_agent_dir(&home.join("Library/Application Support/rcli"), &dir);
+            dir
+        })
+        .clone()
+    };
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
@@ -397,6 +428,27 @@ pub async fn verify(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_controller_files_move_out_of_the_agent_directory_once() {
+        let home = std::env::temp_dir().join(format!("rcli-config-move-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let (old, new) = (home.join("rcli"), home.join("rcli-controller"));
+        std::fs::create_dir_all(old.join("passwords")).unwrap();
+        for file in ["config.json", "passwords/123456789.json", "settings.json"] {
+            std::fs::write(old.join(file), file).unwrap();
+        }
+        super::move_from_agent_dir(&old, &new);
+        assert_eq!(std::fs::read_to_string(new.join("config.json")).unwrap(), "config.json");
+        assert!(new.join("passwords/123456789.json").exists());
+        assert!(old.join("settings.json").exists() && !new.join("settings.json").exists(), "the Agent's files stay");
+
+        // A later run finds the new directory and leaves a file put back in the old one alone.
+        std::fs::write(old.join("config.json"), "stale").unwrap();
+        super::move_from_agent_dir(&old, &new);
+        assert_eq!(std::fs::read_to_string(new.join("config.json")).unwrap(), "config.json");
+        std::fs::remove_dir_all(&home).unwrap();
+    }
+
     #[test]
     fn the_server_address_must_be_https_unless_it_is_loopback() {
         use super::check_transport as ok;

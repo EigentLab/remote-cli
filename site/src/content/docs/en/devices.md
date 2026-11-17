@@ -30,6 +30,7 @@ The three bare binaries are also what a Server hands out as Agent Builds (see th
 | Runs | as you, while you are logged in | as root or SYSTEM, from boot |
 | Lock and login screens, UAC | no | yes |
 | Terminal as another user or root | no | yes |
+| Local Device (`local`) | you | root, and the user logged in at the screen |
 | Input on Wayland | no | yes |
 | Server | optional: without one, only local control | required |
 | Controller configuration | yours alone | shared by every user of the machine |
@@ -121,8 +122,8 @@ Open the `.dmg` and drag `rcli` to Applications, then open it. The build is not 
 ### Service Mode
 
 ```bash
-chmod +x rcli-1.0.1-linux-x86_64
-sudo ./rcli-1.0.1-linux-x86_64 install --server rcli.example.com:9443 --key rk_<fingerprint>_<secret>
+chmod +x rcli-1.0.3-linux-x86_64
+sudo ./rcli-1.0.3-linux-x86_64 install --server rcli.example.com:9443 --key rk_<fingerprint>_<secret>
 ```
 
 ```text
@@ -161,7 +162,7 @@ RCLI_SERVER_KEY=rk_<fingerprint>_<secret>
 # RCLI_TERMINAL_USER=alice
 # RCLI_ALLOW_ROOT=1
 CONF
-sudo apt install ./rcli_1.0.1_amd64.deb
+sudo apt install ./rcli_1.0.3_amd64.deb
 systemctl status rcli-agent.service --no-pager
 ```
 

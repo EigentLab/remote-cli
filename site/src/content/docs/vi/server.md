@@ -20,7 +20,7 @@ Script này cũng nằm trong repo: `https://raw.githubusercontent.com/EigentLab
 Script không hỏi gì. Nó cài Docker bằng script của Docker nếu máy chưa có, ghi mọi thứ vào `/opt/rcli/`, sinh mọi secret vào `/opt/rcli/.env`, kéo image Server và Dashboard đúng phiên bản của nó từ `ghcr.io/eigentlab/`, khởi động chúng và tạo User đầu tiên `admin` với mật khẩu ngẫu nhiên. Cuối cùng nó in ra:
 
 ```text
-rcli 1.0.1 is running.
+rcli 1.0.3 is running.
 
   Dashboard:       https://203.0.113.10:3443
   CA fingerprint:  4f1c…
@@ -39,7 +39,7 @@ Sau đó:
 
 1. Mở các [cổng](#cổng) mà script nêu.
 2. Đăng nhập Dashboard bằng `admin` và đổi mật khẩu ở trang User (hoặc tạo User của riêng bạn ở đó rồi vô hiệu hoá `admin`).
-3. Upload các file `rcli` của [bản phát hành trên GitHub](https://github.com/EigentLab/remote-cli/releases) ở trang **Cập nhật Agent**. File tên kiểu `rcli-1.0.1-linux-x86_64` tự điền phiên bản và target. Device mới tải `rcli` từ các Agent Build này, nên lệnh cài ở trang Hướng dẫn kết nối chỉ chạy được sau bước này. Package `.dmg` và `.deb` upload bằng `rcli package publish` (xem [Quản lý Server](/vi/usage/#quản-lý-server)).
+3. Upload các file `rcli` của [bản phát hành trên GitHub](https://github.com/EigentLab/remote-cli/releases) ở trang **Cập nhật Agent**. File tên kiểu `rcli-1.0.3-linux-x86_64` tự điền phiên bản và target. Device mới tải `rcli` từ các Agent Build này, nên lệnh cài ở trang Hướng dẫn kết nối chỉ chạy được sau bước này. Package `.dmg` và `.deb` upload bằng `rcli package publish` (xem [Quản lý Server](/vi/usage/#quản-lý-server)).
 4. Thêm Device: xem [Cài trên Device](/vi/devices/).
 
 ## Năm chế độ
@@ -257,7 +257,7 @@ Bằng root:
 cd /opt/rcli
 docker compose down -v        # dừng rcli và xoá các volume: database, file, chứng chỉ
 cd / && rm -rf /opt/rcli      # file compose, file proxy và .env (cùng master key)
-docker image rm ghcr.io/eigentlab/remote-cli-server:1.0.1 ghcr.io/eigentlab/remote-cli-dashboard:1.0.1
+docker image rm ghcr.io/eigentlab/remote-cli-server:1.0.3 ghcr.io/eigentlab/remote-cli-dashboard:1.0.3
 ```
 
 Docker vẫn được giữ. Đóng các cổng đã mở (`sudo ufw delete allow 9443/tcp`, v.v.). Các Device còn cài vẫn cố kết nối: chạy `rcli uninstall` trên từng máy (lệnh cảnh báo khi không tới được Server và vẫn gỡ bản cài cục bộ).
@@ -270,14 +270,14 @@ Dùng khi script cài không phù hợp: OS hoặc kiến trúc khác, cấu hì
 
    ```bash
    mkdir rcli && cd rcli
-   curl -fsSLO https://raw.githubusercontent.com/EigentLab/remote-cli/v1.0.1/compose.yaml
+   curl -fsSLO https://raw.githubusercontent.com/EigentLab/remote-cli/v1.0.3/compose.yaml
    ```
 
 2. Viết `.env` cạnh nó:
 
    ```bash
    cat > .env <<EOF
-   RCLI_VERSION=1.0.1
+   RCLI_VERSION=1.0.3
    RCLI_BOOTSTRAP_ADMIN_TOKEN=$(openssl rand -hex 16)
    RCLI_MASTER_KEY=$(openssl rand -hex 32)
    RCLI_TURN_SECRET=$(openssl rand -hex 16)

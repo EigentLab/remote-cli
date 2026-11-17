@@ -30,6 +30,7 @@ Ba binary trần cũng là thứ Server phát ra làm Agent Build (xem [Hướng
 | Chạy | dưới user của bạn, khi bạn đã đăng nhập | dưới root hoặc SYSTEM, từ lúc khởi động |
 | Màn khoá, màn đăng nhập, UAC | không | có |
 | Terminal dưới user khác hoặc root | không | có |
+| Local Device (`local`) | bạn | root, và user đang đăng nhập ở màn hình |
 | Input trên Wayland | không | có |
 | Server | tuỳ chọn: không có thì chỉ điều khiển cục bộ | bắt buộc |
 | Cấu hình Controller | của riêng bạn | dùng chung cho mọi user trên máy |
@@ -121,8 +122,8 @@ Mở file `.dmg`, kéo `rcli` vào Applications rồi mở nó. Bản dựng ch�
 ### Service Mode
 
 ```bash
-chmod +x rcli-1.0.1-linux-x86_64
-sudo ./rcli-1.0.1-linux-x86_64 install --server rcli.example.com:9443 --key rk_<fingerprint>_<secret>
+chmod +x rcli-1.0.3-linux-x86_64
+sudo ./rcli-1.0.3-linux-x86_64 install --server rcli.example.com:9443 --key rk_<fingerprint>_<secret>
 ```
 
 ```text
@@ -161,7 +162,7 @@ RCLI_SERVER_KEY=rk_<fingerprint>_<secret>
 # RCLI_TERMINAL_USER=alice
 # RCLI_ALLOW_ROOT=1
 CONF
-sudo apt install ./rcli_1.0.1_amd64.deb
+sudo apt install ./rcli_1.0.3_amd64.deb
 systemctl status rcli-agent.service --no-pager
 ```
 

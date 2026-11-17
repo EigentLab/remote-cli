@@ -113,7 +113,7 @@ The person entitled to change a Device's Device Password, Device Settings, Serve
 _Avoid_: admin, local admin, installer
 
 **Local Device**:
-The Device rcli is installed on, addressed as `local`. Its Device Owner controls it through the Agent with no Server, Device Password or Control Lock.
+The Device rcli is installed on, addressed as `local`. Its Device Owner, and in Service Mode the user logged in at its screen, controls it through the Agent with no Server, Device Password or Control Lock.
 _Avoid_: this machine, localhost, self
 
 **Session Window**:

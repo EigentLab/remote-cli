@@ -1,6 +1,6 @@
 ---
 title: Known limitations
-description: What rcli 1.0.1 does not do, or does only in part.
+description: What rcli 1.0.3 does not do, or does only in part.
 sidebar:
   order: 5
 ---
