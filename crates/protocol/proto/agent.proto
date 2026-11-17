@@ -1,0 +1,607 @@
+// Messages on the persistent Agent <-> Server TLS connection.
+// Each frame is a length-delimited (u32 BE) encoded AgentMessage or ServerMessage.
+// Extend by adding new oneof variants with fresh field numbers.
+syntax = "proto3";
+package rcli.agent.v1;
+
+message AgentMessage {
+  oneof msg {
+    RegisterRequest register = 1;
+    Heartbeat heartbeat = 2;
+    AgentHello hello = 17;
+    UpdateFailed update_failed = 170;
+    Inventory inventory = 3;
+    ProcessList processes = 31;
+    DeviceInfo device_info = 32;
+    ActResult act_result = 5;
+    DisplayList displays = 50;
+    ExecResult exec_result = 11;
+    WakeResult wake_result = 14;
+    PowerResult power_result = 13;
+    LiveAnswer live_answer = 21;
+    ShellOpened shell_opened = 12;
+    ShellOutput shell_output = 120;
+    ShellExit shell_exit = 121;
+    IdentityUpdate identity_update = 20;
+    // The person at the Device disconnected a Controller (`rcli agent disconnect`).
+    DisconnectController disconnect_controller = 23;
+    // The Agent is being uninstalled (`rcli uninstall`): the Server deletes this Device and closes the connection.
+    // Sent with the Device's own certificate.
+    UnregisterRequest unregister = 25;
+    // The Device Owner force-released the Control Lock (`rcli agent release-lock`).
+    ReleaseControlLock release_control_lock = 26;
+  }
+  reserved 30; // was a bare Resources delta
+  reserved 40; // was ResourceSample: the Server keeps no resource history (ADR 0011)
+  reserved 24; // was ConnectDecision, for the audit log the Server no longer keeps
+  reserved 22; // was the Agent's answer to a User's identity change
+}
+
+message ServerMessage {
+  oneof msg {
+    RegisterResponse registered = 1;
+    Error error = 2;
+    AgentUpdate update = 17;
+    ProcessListRequest list_processes = 3;
+    DeviceInfoRequest device_info = 32;
+    ActRequest act = 5;
+    DisplaysRequest list_displays = 50;
+    ExecRequest exec = 11;
+    ShellOpen shell_open = 12;
+    ShellInput shell_input = 120;
+    ShellResize shell_resize = 121;
+    ShellClose shell_close = 122;
+    ControlIndicator control_indicator = 7;
+    WakeRequest wake = 14;
+    PowerRequest power = 13;
+    LiveOffer live_offer = 21;
+    LiveClose live_close = 210;
+    IdentityUpdated identity_updated = 20;
+    // Sent at the start of every session, so an Admin's correction reaches every Device on its next connection.
+    ApiAddress api_address = 30;
+  }
+  reserved 22; // was identity_change: Users no longer change a Device's identity (ADR 0011)
+}
+
+// The API Address (the Dashboard's public https:// URL Controllers call); empty until the Server has learned it.
+message ApiAddress {
+  string url = 1;
+}
+
+// Sent on a connection without a client certificate. The Server checks the Server Key's
+// secret, signs the CSR, and returns the Device's mTLS client certificate. With an empty `csr_pem` it only checks
+// the secret: a RegisterResponse carrying just `ca_pem`, and no Device is created.
+message RegisterRequest {
+  string server_key = 1;
+  string csr_pem = 2;
+  string hostname = 3;
+}
+
+message RegisterResponse {
+  // 9-digit Device ID.
+  string device_id = 1;
+  string cert_pem = 2;
+  // 3 was the update key Devices pinned (ADR 0008).
+  reserved 3;
+  // The Server's CA (PEM) whose fingerprint the Server Key pinned; the Device checks it and keeps it to trust later sessions.
+  string ca_pem = 4;
+  // The Device Password generated at registration; the Device keeps it in its Secret Store, the Server only its hash.
+  string device_password = 5;
+  // The API Address; empty until the Server has learned it.
+  string api_address = 6;
+}
+
+// Sent by a registered Agent so the Server can detect half-open connections.
+message Heartbeat {}
+
+message Error {
+  string code = 1;
+  string message = 2;
+}
+
+// First message of every Device session: what the Agent runs.
+message AgentHello {
+  string version = 1;
+  // `<os>-<arch>` of the Agent binary, e.g. `linux-x86_64`.
+  string target = 2;
+}
+
+// An Agent build to install. The Agent downloads it from the build lookup endpoint and checks it against `sha256`.
+message AgentUpdate {
+  string version = 1;
+  string target = 2;
+  // 4 was the Ed25519 signature; old Servers still send it and Agents skip it (ADR 0008).
+  reserved 3, 4;
+  uint64 size = 5;
+  // Lowercase hex.
+  string sha256 = 6;
+}
+
+// The Agent refused or failed to install an AgentUpdate.
+message UpdateFailed {
+  string version = 1;
+  string reason = 2;
+}
+
+// Hardware and OS facts. Sent in full at session start and whenever it changes.
+message Inventory {
+  string os = 1;
+  string os_version = 2;
+  string hostname = 3;
+  string cpu_model = 4;
+  uint32 cpu_cores = 5;
+  uint64 ram_bytes = 6;
+  repeated Disk disks = 7;
+  repeated string gpus = 8;
+  repeated NetworkInterface network_interfaces = 9;
+  string serial = 10;
+  repeated Display displays = 11;
+}
+
+message Disk {
+  string name = 1;
+  string mount = 2;
+  uint64 total_bytes = 3;
+}
+
+message NetworkInterface {
+  string name = 1;
+  string mac = 2;
+  // "address/prefix", e.g. "192.168.1.20/24" (the prefix lets the Server match Wake Relays by subnet).
+  repeated string ips = 3;
+}
+
+message Display {
+  string name = 1;
+  uint32 width = 2;
+  uint32 height = 3;
+}
+
+// Where the console session is: who an AI Controller will face.
+enum SessionState {
+  SESSION_STATE_UNSPECIFIED = 0;
+  SESSION_STATE_ACTIVE = 1;       // a user is logged in and unlocked
+  SESSION_STATE_LOCK_SCREEN = 2;  // a user is logged in, screen locked
+  SESSION_STATE_LOGIN_SCREEN = 3; // nobody logged in
+}
+
+// Current resources, sampled every 5 s. The first message of a session is complete;
+// later ones are deltas: only fields that changed are set (protobuf merge semantics,
+// so `disks` entries replace per mount). Unset optional = unavailable or unchanged.
+message Resources {
+  optional double cpu_percent = 1;
+  optional uint64 ram_used_bytes = 2;
+  map<string, double> disk_used_percent = 3; // by mount
+  optional uint64 disk_read_bytes_per_sec = 4;
+  optional uint64 disk_write_bytes_per_sec = 5;
+  optional uint64 net_up_bytes_per_sec = 6;
+  optional uint64 net_down_bytes_per_sec = 7;
+  optional double gpu_percent = 8;
+  optional uint64 uptime_secs = 9;
+  optional string logged_in_user = 10; // "" = nobody
+  optional SessionState session = 11;
+  optional double cpu_temp_celsius = 12;
+  optional double battery_percent = 13;
+  optional bool battery_charging = 14;
+}
+
+// A Controller asked for the Device's info and metrics: answered with a DeviceInfo carrying the same request_id.
+message DeviceInfoRequest {
+  uint64 request_id = 1;
+}
+
+// The Device's inventory and a complete resources sample, read when asked.
+message DeviceInfo {
+  uint64 request_id = 1;
+  Inventory inventory = 2;
+  Resources resources = 3;
+  string error = 4; // non-empty if the Agent could not read them
+}
+
+// Answered with a ProcessList carrying the same request_id.
+message ProcessListRequest {
+  uint64 request_id = 1;
+}
+
+message ProcessList {
+  uint64 request_id = 1;
+  repeated Process processes = 2;
+  string error = 3; // non-empty if the Agent could not list processes
+}
+
+message Process {
+  uint32 pid = 1;
+  string name = 2;
+  string user = 3;
+  double cpu_percent = 4;
+  uint64 memory_bytes = 5;
+}
+
+// --- Actions and Observations (ticket 05) ---
+// Requests carry a request_id; the Agent answers with the same id.
+
+// Runs `actions` in order, then returns one Observation (ActResult).
+message ActRequest {
+  uint64 request_id = 1;
+  repeated Action actions = 2;
+  ObserveMode observe = 3;
+  // Which display to observe: unset = the display last acted on.
+  optional uint32 display = 4;
+  bool all_displays = 5;
+  // Who asks, as in ExecRequest.controller: the accept gate admits it, and "unchanged" is relative to the last
+  // image this Controller got.
+  string controller = 6;
+  // `frames`: at most this many frames per display (the last one is always the final screen).
+  uint32 max_frames = 8;
+  // Detect Marks: annotate the images and return the Mark table.
+  bool marks = 10;
+  // Open media channel (LiveOffer with `media`) of this Controller: large image/clip bytes go over it, not here.
+  string media_session = 26;
+  reserved 27; // was unlock: typed a stored unlock password (ADR 0005)
+  // After the Actions, re-detect Marks until this holds, then observe; error "wait_timeout" (with the
+  // Observation) when it did not hold within its timeout.
+  WaitCondition until = 11;
+}
+
+// Something to wait for on screen, about the Marks whose text matches `text` (as text targets do) and, if set, `role`.
+message WaitCondition {
+  string text = 1;
+  optional string role = 2;
+  uint32 timeout_ms = 3;
+  oneof condition {
+    bool appears = 4;
+    bool disappears = 5;
+    // The one matching Mark's value / Mark States; need an accessibility tree. Exactly one field of each is set.
+    ValueCondition value = 6;
+    StateCondition state = 7;
+  }
+}
+
+message ValueCondition {
+  optional string equals = 1;
+  optional string contains = 2;
+}
+
+message StateCondition {
+  optional string has = 1;
+  optional string lacks = 2;
+}
+
+enum ObserveMode {
+  OBSERVE_MODE_SHOT = 0;
+  OBSERVE_MODE_NONE = 1;
+  // Change-triggered, timestamped frames captured while the Actions run.
+  OBSERVE_MODE_FRAMES = 8;
+  OBSERVE_MODE_CLIP = 9;
+}
+
+// Coordinates are in Observation image space of `display`; the Agent's Coordinate Mapper converts them.
+// Set `mark` or `text` to target a Mark instead of (x, y).
+message Point {
+  uint32 display = 1;
+  uint32 x = 2;
+  uint32 y = 3;
+  // Mark number from the Controller's latest Observation with Marks, which must be `observation`.
+  optional uint32 mark = 10;
+  uint64 observation = 11;
+  // Visible text of a Mark on `display`, detected now.
+  optional string text = 12;
+  // `x` and `y` are real pixels of the display (Live View direct control), not Observation image space.
+  bool native = 13;
+}
+
+message Action {
+  oneof kind {
+    Point move = 1;
+    Point click = 2;
+    Point double_click = 3;
+    Point right_click = 4;
+    Drag drag = 5;
+    Scroll scroll = 6;
+    string type_text = 7;
+    // Key combination, e.g. "ctrl+shift+t".
+    string key = 8;
+    // Sets the value of a field from the accessibility tree directly, without keystrokes.
+    SetValue set_value = 9;
+    // Action Batch: pause this long before the next Action.
+    uint32 wait_ms = 80;
+    // Action Batch: re-detect Marks until this holds; error "wait_timeout" (with the Observation) otherwise.
+    WaitCondition wait_until = 81;
+  }
+}
+
+message SetValue {
+  Point at = 1;
+  string value = 2;
+}
+
+message Drag {
+  Point from = 1;
+  Point to = 2;
+}
+
+message Scroll {
+  Point at = 1;
+  int32 dx = 2;
+  int32 dy = 3;
+}
+
+// `error` set = the request failed (code "invalid_action" for bad input, else a Platform failure).
+message ActResult {
+  uint64 request_id = 1;
+  repeated Image images = 2;
+  Error error = 3;
+  // Index of the Action in `actions` that failed (with `error`).
+  optional uint32 failed_step = 8;
+  // Set when Marks were requested: this Observation's id and its Mark table.
+  uint64 observation = 10;
+  repeated Mark marks = 11;
+  // Set for OBSERVE_MODE_CLIP (then `images` is empty).
+  Clip clip = 9;
+}
+
+// An H.264 recording (MP4) of one display from the first Action until the screen settled, capped in length.
+message Clip {
+  uint32 display = 1;
+  uint32 width = 2;
+  uint32 height = 3;
+  string mime = 4;
+  bytes data = 5;
+  uint32 duration_ms = 6;
+  // Non-zero: `data` was sent over the media channel as blob `p2p` instead.
+  uint64 p2p = 26;
+}
+
+// A numbered on-screen element; the box is in Observation image space of `display`.
+message Mark {
+  uint32 number = 1;
+  string text = 2;
+  string role = 3;
+  uint32 display = 4;
+  uint32 x = 5;
+  uint32 y = 6;
+  uint32 width = 7;
+  uint32 height = 8;
+  // Mark States that differ from the default: disabled, focused, checked, selected, expanded, collapsed.
+  repeated string states = 9;
+  // Content, apart from the label `text`; empty when none or a password field.
+  string value = 10;
+  // Number of the nearest container Mark (window, dialog, menu, list) this one sits in.
+  optional uint32 parent = 11;
+}
+
+message Image {
+  uint32 display = 1;
+  uint32 width = 2;
+  uint32 height = 3;
+  // Same as the last image this Controller got for this display; `data` is empty.
+  bool unchanged = 4;
+  string mime = 5;
+  bytes data = 6;
+  // `frames`: milliseconds since the Agent started the request.
+  uint32 at_ms = 8;
+  // Non-zero: `data` was sent over the media channel as blob `p2p` instead.
+  uint64 p2p = 26;
+}
+
+message DisplaysRequest {
+  uint64 request_id = 1;
+}
+
+message DisplayList {
+  uint64 request_id = 1;
+  repeated DisplayInfo displays = 2;
+  Error error = 3;
+}
+
+// A display, its size in real pixels and its place in the desktop arrangement.
+message DisplayInfo {
+  uint32 index = 1;
+  int32 x = 2;
+  int32 y = 3;
+  uint32 width = 4;
+  uint32 height = 5;
+  // Real pixels per logical point (2.0 on Retina).
+  double scale = 6;
+  bool primary = 7;
+}
+
+// --- One-shot terminal command (ticket 11) ---
+
+// Runs `command` through the OS shell; answered with an ExecResult carrying the same request_id.
+message ExecRequest {
+  uint64 request_id = 1;
+  string command = 2;
+  // Run as root/SYSTEM instead of the Terminal User (the Device's root setting decides).
+  bool as_root = 3;
+  reserved 4; // was root_if_nobody_logged_in
+  // The Agent kills the command after this long.
+  uint32 timeout_ms = 5;
+  // The Controller as the person at the Device sees it, e.g. "dev-laptop (10.0.0.5)" or "alice (Dashboard)".
+  // Named in a root prompt (ticket 07).
+  string requester = 6;
+  // The Controller as listed by `rcli agent info` and matched by `disconnect`: the display name, e.g.
+  // "dev-laptop (10.0.0.5)" or "alice (Dashboard)". `requester` stays the bare name a root prompt shows.
+  string controller = 7;
+}
+
+// `error` set = nothing ran (code "no_logged_in_user", or a Platform failure).
+message ExecResult {
+  uint64 request_id = 1;
+  int32 exit_code = 2; // meaningless when timed_out
+  string stdout = 3;
+  string stderr = 4;
+  bool timed_out = 5;
+  bool as_root = 6; // who it actually ran as
+  Error error = 7;
+  // How root was decided, as the Controller is told: "always", "session", "accepted",
+  // "rejected", "no_session", "never"; empty when root was not asked for.
+  string root_decision = 8;
+  reserved 9; // was connect_decision
+}
+
+// --- Interactive shell (ticket 12) ---
+// A PTY session named by `session` (chosen by the Server). The account it runs as follows the same rules as ExecRequest.
+
+// Answered with ShellOpened carrying the same request_id; then ShellOutput until one ShellExit.
+message ShellOpen {
+  uint64 request_id = 1;
+  string session = 2;
+  bool as_root = 3;
+  reserved 4; // was root_if_nobody_logged_in
+  uint32 cols = 5;
+  uint32 rows = 6;
+  // As in ExecRequest: who asks, named in a root prompt.
+  string requester = 7;
+  // As in ExecRequest.controller: admitted by the accept gate, holds a root grant, ended by `disconnect`.
+  string controller = 8;
+}
+
+// `error` set = no session was started (code "no_logged_in_user", "root_denied", or a Platform failure).
+message ShellOpened {
+  uint64 request_id = 1;
+  bool as_root = 2; // who it actually runs as
+  Error error = 3;
+  // As in ExecResult.
+  string root_decision = 4;
+}
+
+// Keystrokes for the PTY (Ctrl-C is byte 0x03).
+message ShellInput {
+  string session = 1;
+  bytes data = 2;
+}
+
+message ShellResize {
+  string session = 1;
+  uint32 cols = 2;
+  uint32 rows = 3;
+}
+
+// The Controller went away: the Agent kills the session and sends no ShellExit.
+message ShellClose {
+  string session = 1;
+}
+
+message ShellOutput {
+  string session = 1;
+  bytes data = 2;
+}
+
+// The shell ended; no more output follows.
+message ShellExit {
+  string session = 1;
+  int32 exit_code = 2;
+}
+
+// A change to the Device's identity the Agent sends after `rcli agent password|id set` (`identity_update`).
+// Empty = unchanged. The Server checks the Device ID for uniqueness and stores a new password as a hash.
+message IdentityUpdate {
+  uint64 request_id = 1;
+  string device_password = 2;
+  string device_id = 3;
+  reserved 4; // was name: the Server keeps no Device name (ADR 0011)
+}
+
+// `error` set = nothing was changed. `device_id` is the Device ID in effect after the change.
+// Sent by the Server for an Agent-initiated change, and by the Agent for a Server-initiated one.
+message IdentityUpdated {
+  uint64 request_id = 1;
+  Error error = 2;
+  string device_id = 3;
+}
+
+// Show (on) or hide the on-Device indicator that the Device is being controlled.
+// Sent whenever it changes and at the start of every Device session.
+message ControlIndicator {
+  bool on = 1;
+}
+
+// The person at the Device disconnected a Controller (`rcli agent disconnect`). `controller` is the display name
+// `rcli agent info` lists (e.g. "dev-laptop (10.0.0.5)" or "alice (Dashboard)"). The Server releases that
+// Controller's Control Lock and ends its Live View and shells; the Controller may reconnect with the password.
+message DisconnectController {
+  string controller = 1;
+}
+
+// --- Wake (ticket 14) ---
+
+// Sent to a Wake Relay: broadcast a Wake-on-LAN magic packet for `mac` (6 bytes) on the local network.
+message WakeRequest {
+  uint64 request_id = 1;
+  bytes mac = 2;
+}
+
+// `error` set = the packet could not be sent.
+message WakeResult {
+  uint64 request_id = 1;
+  Error error = 2;
+}
+
+// --- Power (ticket 13) ---
+
+enum PowerAction {
+  RESTART = 0;
+  SHUTDOWN = 1;
+  SLEEP = 2;
+  LOCK_SCREEN = 3;
+}
+
+// Restart / Shut down / Sleep the Device, or lock its screen. The Agent replies once the OS has accepted it.
+message PowerRequest {
+  uint64 request_id = 1;
+  PowerAction action = 2;
+  // As in ExecRequest.controller: admitted by the accept gate.
+  string controller = 3;
+}
+
+// `error` set = the OS refused or the adapter failed.
+message PowerResult {
+  uint64 request_id = 1;
+  Error error = 2;
+}
+
+// --- Live view over WebRTC (ticket 21) ---
+// The Server only relays signaling; media goes peer-to-peer between the Agent and the viewer (TURN as fallback).
+// ICE is non-trickle: both SDPs carry all their candidates.
+
+// STUN/TURN server the Agent's peer connection may use; TURN credentials are short-lived (coturn REST API).
+message IceServer {
+  repeated string urls = 1;
+  string username = 2;
+  string credential = 3;
+}
+
+// A viewer's SDP offer; answered with a LiveAnswer carrying the same request_id.
+message LiveOffer {
+  uint64 request_id = 1;
+  // Server-chosen id of this live stream, used by LiveClose.
+  string session = 2;
+  string sdp = 3;
+  repeated IceServer ice_servers = 4;
+  // Display to stream: unset = primary.
+  optional uint32 display = 5;
+  // A media channel (one data channel, no video) for ActRequest.media_session instead of a live stream.
+  bool media = 26;
+  // As in ExecRequest.controller: admitted by the accept gate, and its streams end on `disconnect`.
+  string controller = 27;
+}
+
+// The Agent's SDP answer, or `error` (code "invalid_offer" for a bad offer).
+message LiveAnswer {
+  uint64 request_id = 1;
+  string sdp = 2;
+  Error error = 3;
+}
+
+// Stop live stream `session` (no reply; unknown sessions are ignored).
+message LiveClose {
+  string session = 1;
+}
+
+// `rcli uninstall` on this Device. The Server has no self-removal confirmation: it deletes the Device and closes
+// the connection.
+message UnregisterRequest {}
+
+// The Device Owner ended whoever's Control Lock it is; the Server tells the holder on its next input Action.
+message ReleaseControlLock {}

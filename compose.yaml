@@ -1,0 +1,116 @@
+# Server + Postgres + file storage + Dashboard + coturn. Set RCLI_BOOTSTRAP_ADMIN_TOKEN, RCLI_TURN_SECRET,
+# RCLI_TURN_HOST (the VPS's public name/IP; Agents and browsers must reach it), RCLI_S3_ACCESS_KEY and
+# RCLI_S3_SECRET_KEY (and POSTGRES_PASSWORD) in the environment or .env.
+# The Server and Dashboard images are pulled from ghcr.io/eigentlab at RCLI_VERSION (default `latest`); to build
+# them from source instead, run `docker compose build` or `docker compose up -d --build`.
+# Backup = `pg_dump` of Postgres plus the `filedata` volume (install packages and Agent builds live there, not in
+# the database).
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: rcli
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-rcli}
+      POSTGRES_DB: rcli
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "rcli"]
+      interval: 2s
+      retries: 30
+
+  # SeaweedFS with its S3 gateway: install packages and Agent builds. Internal only (no host port): files are
+  # served through the Server's access checks.
+  storage:
+    image: chrislusf/seaweedfs:4.53
+    restart: unless-stopped
+    command: ["server", "-s3", "-dir=/data"]
+    environment:
+      AWS_ACCESS_KEY_ID: ${RCLI_S3_ACCESS_KEY:?set RCLI_S3_ACCESS_KEY}
+      AWS_SECRET_ACCESS_KEY: ${RCLI_S3_SECRET_KEY:?set RCLI_S3_SECRET_KEY}
+    volumes:
+      - filedata:/data
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8333/healthz"]
+      interval: 2s
+      retries: 30
+
+  server:
+    image: ghcr.io/eigentlab/remote-cli-server:${RCLI_VERSION:-latest}
+    restart: unless-stopped
+    build: .
+    depends_on:
+      postgres:
+        condition: service_healthy
+      storage:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://rcli:${POSTGRES_PASSWORD:-rcli}@postgres:5432/rcli
+      RCLI_BOOTSTRAP_ADMIN_TOKEN: ${RCLI_BOOTSTRAP_ADMIN_TOKEN:?set RCLI_BOOTSTRAP_ADMIN_TOKEN}
+      # The Server Address (names Agents use to reach port 9443 on the host): applied at a start when it changed since
+      # the last one, so a change with `rcli server-address set` or the Server Settings page stands until then.
+      RCLI_AGENT_HOSTNAMES: ${RCLI_AGENT_HOSTNAMES:-localhost}
+      # Seals the CA private key and TOTP secrets: 64 hex chars (`openssl rand -hex 32`). Keep a backup; losing it loses them.
+      RCLI_MASTER_KEY: ${RCLI_MASTER_KEY:-}
+      # The API Address an install's mode gives (install.sh sets it): applied at a start when it changed since the last
+      # one, so a User's correction stands until then. Empty = learned from a User's first https visit.
+      RCLI_API_ADDRESS: ${RCLI_API_ADDRESS:-}
+      # The Dashboard forwards the Controller API: from its IP the Controller's IP is read from X-Forwarded-For (which
+      # the TLS proxy in front of the Dashboard must append), so wrong Device Passwords are counted per real Controller.
+      RCLI_TRUSTED_PROXIES: ${RCLI_TRUSTED_PROXIES:-172.31.250.10}
+      # WebRTC (live view): peers try direct paths first, then relay through coturn with short-lived credentials.
+      RCLI_ICE_URLS: stun:${RCLI_TURN_HOST:-localhost}:3478,turn:${RCLI_TURN_HOST:-localhost}:3478?transport=udp,turn:${RCLI_TURN_HOST:-localhost}:3478?transport=tcp
+      RCLI_TURN_SECRET: ${RCLI_TURN_SECRET:?set RCLI_TURN_SECRET}
+      # The file storage service (the Server creates the bucket if missing).
+      RCLI_S3_ENDPOINT: ${RCLI_S3_ENDPOINT:-http://storage:8333}
+      RCLI_S3_BUCKET: ${RCLI_S3_BUCKET:-rcli}
+      RCLI_S3_ACCESS_KEY: ${RCLI_S3_ACCESS_KEY:?set RCLI_S3_ACCESS_KEY}
+      RCLI_S3_SECRET_KEY: ${RCLI_S3_SECRET_KEY:?set RCLI_S3_SECRET_KEY}
+    ports:
+      # The Controller API (8080) stays internal: Controllers reach it through the Dashboard (ADR 0006).
+      - "${RCLI_AGENT_PORT:-9443}:8443" # Agent connections (TLS / mTLS); inside the container the port stays 8443
+
+  dashboard:
+    image: ghcr.io/eigentlab/remote-cli-dashboard:${RCLI_VERSION:-latest}
+    restart: unless-stopped
+    build: ./dashboard
+    depends_on: [server]
+    environment:
+      RCLI_API_URL: http://server:8080
+    ports:
+      - "${RCLI_DASHBOARD_PORT:-3080}:3000" # Dashboard and Controller API (put TLS in front of it; reach it only through that proxy)
+    networks:
+      default:
+        ipv4_address: 172.31.250.10 # RCLI_TRUSTED_PROXIES
+
+  coturn:
+    image: coturn/coturn:4.6
+    restart: unless-stopped
+    # Host networking: TURN allocates relay ports from a range; open 3478 tcp/udp and 49160-49200/udp on the VPS.
+    network_mode: host
+    command:
+      - --listening-port=3478
+      - --min-port=49160
+      - --max-port=49200
+      - --realm=rcli
+      - --use-auth-secret
+      - --static-auth-secret=${RCLI_TURN_SECRET:?set RCLI_TURN_SECRET}
+      - --fingerprint
+      - --no-cli
+      - --no-multicast-peers
+      # Never relay into private networks (the VPS's Docker network, Postgres).
+      - --denied-peer-ip=10.0.0.0-10.255.255.255
+      - --denied-peer-ip=172.16.0.0-172.31.255.255
+      - --denied-peer-ip=192.168.0.0-192.168.255.255
+      - --log-file=stdout
+
+volumes:
+  pgdata:
+  filedata:
+
+networks:
+  default:
+    ipam:
+      config:
+        - subnet: 172.31.250.0/24 # fixed, so the Server can trust the Dashboard's address

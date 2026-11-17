@@ -1,0 +1,371 @@
+//! Controller API (HTTP). One file per area; each exposes `routes()` merged here.
+
+mod actions;
+pub(crate) mod address_book;
+mod control_lock;
+mod devices;
+mod exec;
+mod install;
+mod power;
+mod live;
+mod sessions;
+pub(crate) mod settings;
+mod shell;
+mod updates;
+mod users;
+mod wake;
+
+use std::sync::Arc;
+
+use axum::{
+    extract::FromRequestParts,
+    http::{request::Parts, StatusCode},
+    response::{IntoResponse, Response},
+    routing::get,
+    Json, Router,
+};
+use serde_json::json;
+
+use crate::{storage, AppState};
+
+pub type State = Arc<AppState>;
+
+pub fn router(state: State) -> Router {
+    Router::new()
+        .route("/api/v1/server-ca", get(|s: axum::extract::State<State>| async move { s.ca.cert_pem.clone() }))
+        .route("/api/v1/server-key", get(server_key))
+        .merge(settings::routes())
+        .merge(devices::routes())
+        .merge(address_book::routes())
+        .merge(install::routes())
+        .merge(updates::routes())
+        .merge(users::routes())
+        .merge(control_lock::routes())
+        .merge(actions::routes())
+        .merge(exec::routes())
+        .merge(wake::routes())
+        .merge(power::routes())
+        .merge(sessions::routes())
+        .merge(live::routes())
+        .merge(shell::routes())
+        .layer(axum::middleware::map_response_with_state(state.clone(), minimum_version_header))
+        .with_state(state)
+}
+
+/// Every response announces the Minimum Version, when one is set, so Controllers below it can warn.
+async fn minimum_version_header(axum::extract::State(state): axum::extract::State<State>, mut resp: Response) -> Response {
+    let minimum = state.settings.minimum_version().await;
+    if let Some(value) = Some(minimum).filter(|m| !m.is_empty()).and_then(|m| m.parse().ok()) {
+        resp.headers_mut().insert("x-rcli-minimum-version", value);
+    }
+    resp
+}
+
+/// The Server Key: Agents and Controllers need it to connect.
+async fn server_key(
+    _: SignedIn,
+    axum::extract::State(state): axum::extract::State<State>,
+) -> Json<serde_json::Value> {
+    Json(json!({ "server_key": state.settings.key().await, "ca_fingerprint": state.ca.fingerprint }))
+}
+
+/// Whole seconds left until `until`, rounded up so "try again in 0s" is never shown while still locked.
+fn remaining_secs(until: chrono::DateTime<chrono::Utc>, now: chrono::DateTime<chrono::Utc>) -> i64 {
+    let ms = (until - now).num_milliseconds().max(0);
+    (ms + 999) / 1000
+}
+
+/// Typed API error: `{"error": {"code": "...", "message": "...", "hint": "..."}}`.
+#[derive(Debug)]
+pub struct ApiError {
+    pub status: StatusCode,
+    pub code: &'static str,
+    pub message: String,
+    /// Extra typed fields next to code and message, e.g. `holder` of a Control Lock.
+    pub details: serde_json::Map<String, serde_json::Value>,
+}
+
+impl ApiError {
+    pub fn new(status: StatusCode, code: &'static str, message: impl Into<String>) -> Self {
+        Self { status, code, message: message.into(), details: Default::default() }
+    }
+
+    pub fn with(mut self, key: &str, value: impl Into<serde_json::Value>) -> Self {
+        self.details.insert(key.into(), value.into());
+        self
+    }
+}
+
+impl IntoResponse for ApiError {
+    fn into_response(self) -> Response {
+        let mut error = self.details;
+        error.insert("code".into(), self.code.into());
+        error.insert("message".into(), self.message.into());
+        error.entry("hint").or_insert(rcli_protocol::hint(self.code).into());
+        (self.status, Json(json!({ "error": error }))).into_response()
+    }
+}
+
+impl From<crate::agent_link::RequestError> for ApiError {
+    fn from(e: crate::agent_link::RequestError) -> Self {
+        use crate::agent_link::RequestError;
+        match e {
+            RequestError::NotConnected => ApiError::new(StatusCode::CONFLICT, "device_not_connected", "the Device's Agent is not connected"),
+            RequestError::Timeout => ApiError::new(StatusCode::GATEWAY_TIMEOUT, "agent_timeout", "the Agent did not answer in time"),
+        }
+    }
+}
+
+/// The Agent's typed refusal as an API error; any other code is the Agent's own failure (502 `agent_error`).
+pub fn agent_error(e: rcli_protocol::agent::Error) -> ApiError {
+    let (status, code) = match e.code.as_str() {
+        "invalid_action" => (StatusCode::BAD_REQUEST, "invalid_action"),
+        "stale_mark" => (StatusCode::BAD_REQUEST, "stale_mark"),
+        "ambiguous_text" => (StatusCode::BAD_REQUEST, "ambiguous_text"),
+        "text_not_found" => (StatusCode::BAD_REQUEST, "text_not_found"),
+        "invalid_offer" => (StatusCode::BAD_REQUEST, "invalid_offer"),
+        "no_display" => (StatusCode::CONFLICT, "no_display"),
+        // A value or Mark State Wait Condition on a screen read by OCR (lock or login screen).
+        "no_accessibility_tree" => (StatusCode::CONFLICT, "no_accessibility_tree"),
+        // A Wait Condition did not hold in time; the reply still carries the Observation.
+        "wait_timeout" => (StatusCode::GATEWAY_TIMEOUT, "wait_timeout"),
+        // The Device's root setting refused, or asked and nobody answered.
+        "root_denied" => (StatusCode::FORBIDDEN, "root_denied"),
+        // `password+accept` refused this Controller (rejected, timed out, or no session to ask in).
+        "connect_denied" => (StatusCode::FORBIDDEN, "connect_denied"),
+        // A User Mode Device cannot do this (root, another account); its Device Owner can switch to Service Mode.
+        "service_mode_required" => (StatusCode::CONFLICT, "service_mode_required"),
+        // A Controller capability (mouse and keyboard, terminal, power) is switched off for this Controller.
+        "capability_off" => (StatusCode::FORBIDDEN, "capability_off"),
+        _ => (StatusCode::BAD_GATEWAY, "agent_error"),
+    };
+    // The Agent's own code says more than the API code (`platform` and `no_logged_in_user` are both `agent_error`).
+    ApiError::new(status, code, e.message).with("hint", rcli_protocol::hint(&e.code))
+}
+
+/// 400 `bad_request`, e.g. a body that is not the expected JSON.
+pub fn bad_request(message: impl ToString) -> ApiError {
+    ApiError::new(StatusCode::BAD_REQUEST, "bad_request", message.to_string())
+}
+
+impl From<anyhow::Error> for ApiError {
+    fn from(e: anyhow::Error) -> Self {
+        tracing::error!("internal error: {e:#}");
+        Self::new(StatusCode::INTERNAL_SERVER_ERROR, "internal", "internal error")
+    }
+}
+
+/// The Controller's IP: the TCP peer, or, when the peer is a trusted reverse proxy, the address that proxy appended
+/// last to `X-Forwarded-For` (anything before it is the client's own word). A missing peer is a test without one.
+fn client_ip(peer: Option<std::net::IpAddr>, forwarded: Option<&str>, trusted: &[std::net::IpAddr]) -> String {
+    let peer = peer.unwrap_or(std::net::Ipv4Addr::LOCALHOST.into());
+    let from_proxy = || forwarded?.rsplit(',').next()?.trim().parse::<std::net::IpAddr>().ok();
+    match trusted.contains(&peer) {
+        true => from_proxy().unwrap_or(peer).to_string(),
+        false => peer.to_string(),
+    }
+}
+
+/// Whether a URL host (IPv6 with or without brackets) is this computer: `localhost` or a loopback IP.
+fn loopback(host: &str) -> bool {
+    let host = host.trim_matches(['[', ']']);
+    host.eq_ignore_ascii_case("localhost") || host.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.to_canonical().is_loopback())
+}
+
+/// The API Address a request reveals: the `https://` origin a trusted proxy (the Dashboard) says it arrived at.
+/// `http`, localhost and private, loopback or link-local IPs never count, so a test visit on an internal port
+/// cannot set it.
+fn api_address_of(
+    peer: Option<std::net::IpAddr>,
+    proto: Option<&str>,
+    host: Option<&str>,
+    trusted: &[std::net::IpAddr],
+) -> Option<String> {
+    use std::net::IpAddr;
+    if !trusted.contains(&peer?) || !proto?.eq_ignore_ascii_case("https") {
+        return None;
+    }
+    let authority: axum::http::uri::Authority = host?.parse().ok()?;
+    let name = authority.host().trim_start_matches('[').trim_end_matches(']');
+    let internal = loopback(name)
+        || name.to_ascii_lowercase().ends_with(".localhost")
+        || match name.parse::<IpAddr>().map(|ip| ip.to_canonical()) {
+            Ok(IpAddr::V4(ip)) => ip.is_private() || ip.is_link_local() || ip.is_unspecified(),
+            Ok(IpAddr::V6(ip)) => ip.is_unique_local() || ip.is_unicast_link_local() || ip.is_unspecified(),
+            Err(_) => false,
+        };
+    // A `user@host` authority is not an address anyone serves the Dashboard at.
+    (!internal && !authority.as_str().contains('@')).then(|| format!("https://{authority}"))
+}
+
+/// Extractor: the request is either a User session (bearer token) or a password connection
+/// (`X-Rcli-Server-Key`, `X-Rcli-Device`, `X-Rcli-Device-Password`, `X-Rcli-Controller`).
+pub struct Caller(pub crate::auth::User);
+
+impl FromRequestParts<State> for Caller {
+    type Rejection = ApiError;
+
+    async fn from_request_parts(parts: &mut Parts, state: &State) -> Result<Self, Self::Rejection> {
+        let header = |name: &str| parts.headers.get(name).and_then(|v| v.to_str().ok());
+        let token = header("authorization").and_then(|v| v.strip_prefix("Bearer "));
+        let peer = parts.extensions.get::<axum::extract::ConnectInfo<std::net::SocketAddr>>().map(|c| c.0.ip());
+        if let Some(t) = token {
+            let user = crate::auth::authenticate(state, t)
+                .await?
+                .ok_or_else(|| ApiError::new(StatusCode::UNAUTHORIZED, "unauthorized", "missing or invalid API token"))?;
+            // Only the Dashboard's own requests mark themselves; its `/api/v1` pass-through for Controllers strips the
+            // mark, so a User's CLI call through the Dashboard URL teaches nothing.
+            let (proto, host) = (header("x-forwarded-proto"), header("x-forwarded-host"));
+            let dashboard = header("x-rcli-dashboard").is_some();
+            if let Some(url) = dashboard.then(|| api_address_of(peer, proto, host, &state.config.trusted_proxies)).flatten() {
+                state.settings.set_api_address(&state.db, &url, true).await?;
+            }
+            return Ok(Caller(user));
+        }
+        let (Some(server_key), Some(device), Some(password)) =
+            (header("x-rcli-server-key"), header("x-rcli-device"), header("x-rcli-device-password"))
+        else {
+            return Err(ApiError::new(StatusCode::UNAUTHORIZED, "unauthorized", "missing or invalid API token"));
+        };
+        let controller = header("x-rcli-controller").unwrap_or("unknown");
+        let ip = request_ip(parts, state);
+        crate::auth::authenticate_controller(state, server_key, device, password, controller, &ip)
+            .await?
+            .map(Caller)
+            .map_err(|e| controller_refused(e, state))
+    }
+}
+
+/// A refused password check: the same answer for a wrong Server Key, Device ID or Device Password.
+fn controller_refused(e: crate::auth::ControllerError, state: &State) -> ApiError {
+    match e {
+        crate::auth::ControllerError::Unauthorized => ApiError::new(
+            StatusCode::UNAUTHORIZED,
+            "unauthorized",
+            "wrong Server Key or Device Password, or no Device with this Device ID",
+        ),
+        crate::auth::ControllerError::Locked(until) => ApiError::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            "too_many_attempts",
+            format!("too many wrong Device Passwords; try again in {}s (after {until})", remaining_secs(until, state.clock.now())),
+        )
+        .with("locked_until", until.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)),
+    }
+}
+
+/// Extractor: the Controller's IP (see `client_ip`), by which wrong Device Passwords are counted.
+pub struct ClientIp(pub String);
+
+impl FromRequestParts<State> for ClientIp {
+    type Rejection = ApiError;
+
+    async fn from_request_parts(parts: &mut Parts, state: &State) -> Result<Self, Self::Rejection> {
+        Ok(ClientIp(request_ip(parts, state)))
+    }
+}
+
+fn request_ip(parts: &Parts, state: &State) -> String {
+    let peer = parts.extensions.get::<axum::extract::ConnectInfo<std::net::SocketAddr>>().map(|c| c.0.ip());
+    let forwarded = parts.headers.get_all("x-forwarded-for").iter().next_back().and_then(|v| v.to_str().ok());
+    client_ip(peer, forwarded, &state.config.trusted_proxies)
+}
+
+/// Extractor: like `Caller`, but a signed-in User; a password connection (scoped to one Device) gets 403
+/// `user_session_required`. Every User may administer the Server (ADR 0009).
+pub struct SignedIn(pub crate::auth::User);
+
+impl FromRequestParts<State> for SignedIn {
+    type Rejection = ApiError;
+
+    async fn from_request_parts(parts: &mut Parts, state: &State) -> Result<Self, Self::Rejection> {
+        let Caller(user) = Caller::from_request_parts(parts, state).await?;
+        if user.device_scope.is_some() {
+            return Err(ApiError::new(
+                StatusCode::FORBIDDEN,
+                "user_session_required",
+                "a password connection may only reach its own Device; sign in as a User",
+            ));
+        }
+        Ok(SignedIn(user))
+    }
+}
+
+/// Streams the request body into storage under `prefix`; a body over the route's `DefaultBodyLimit` is 413.
+async fn store(state: &State, prefix: &str, request: axum::extract::Request) -> Result<storage::Stored, ApiError> {
+    let body = axum::RequestExt::into_limited_body(request).into_data_stream();
+    state.storage.put(prefix, body).await.map_err(|e| {
+        if e.chain().any(|c| c.is::<http_body_util::LengthLimitError>()) {
+            ApiError::new(StatusCode::PAYLOAD_TOO_LARGE, "too_large", "the file is over the upload limit")
+        } else {
+            e.into()
+        }
+    })
+}
+
+/// Removes the stored object `sha256` under `prefix` unless a row of that prefix's table still points at it (two
+/// rows may share bytes).
+async fn delete_unreferenced(state: &State, prefix: &str, sha256: &str) -> anyhow::Result<()> {
+    let query = match prefix {
+        storage::PACKAGES => "SELECT EXISTS (SELECT 1 FROM install_packages WHERE sha256 = $1)",
+        _ => "SELECT EXISTS (SELECT 1 FROM agent_builds WHERE sha256 = $1)",
+    };
+    let used: bool = sqlx::query_scalar(query).bind(sha256).fetch_one(&state.db).await?;
+    if !used {
+        state.storage.delete(prefix, sha256).await?;
+    }
+    Ok(())
+}
+
+/// Streams a stored file of `size` bytes. A single `Range: bytes=N-` or `bytes=N-M` gets `206` with that slice.
+// shortcut: no cap on simultaneous downloads; add a limit here when fleets grow.
+async fn stored_file(state: &State, prefix: &str, sha256: &str, size: u64, headers: &axum::http::HeaderMap) -> Result<Response, ApiError> {
+    use axum::http::header;
+    let requested = headers.get(header::RANGE).and_then(|v| v.to_str().ok()).and_then(parse_range);
+    let range = match requested {
+        None => None,
+        Some((start, end)) => {
+            let end = end.unwrap_or(u64::MAX).min(size.saturating_sub(1));
+            if start >= size || end < start {
+                let mut refused = ApiError::new(StatusCode::RANGE_NOT_SATISFIABLE, "bad_range", format!("the file has {size} bytes")).into_response();
+                refused.headers_mut().insert(header::CONTENT_RANGE, format!("bytes */{size}").parse().expect("digits"));
+                return Ok(refused);
+            }
+            Some(start..end + 1)
+        }
+    };
+    let body = axum::body::Body::from_stream(state.storage.get(prefix, sha256, range.clone()).await?);
+    let response = Response::builder().header(header::CONTENT_TYPE, "application/octet-stream");
+    let response = match range {
+        None => response.status(StatusCode::OK).header(header::CONTENT_LENGTH, size),
+        Some(r) => response
+            .status(StatusCode::PARTIAL_CONTENT)
+            .header(header::CONTENT_LENGTH, r.end - r.start)
+            .header(header::CONTENT_RANGE, format!("bytes {}-{}/{size}", r.start, r.end - 1)),
+    };
+    Ok(response.body(body).map_err(anyhow::Error::from)?)
+}
+
+/// `bytes=N-` or `bytes=N-M` as (N, M); anything else (suffix or multiple ranges) is ignored and the whole file sent.
+fn parse_range(value: &str) -> Option<(u64, Option<u64>)> {
+    let (start, end) = value.strip_prefix("bytes=")?.split_once('-')?;
+    Some((start.trim().parse().ok()?, if end.trim().is_empty() { None } else { Some(end.trim().parse().ok()?) }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::client_ip;
+
+    #[test]
+    fn the_forwarded_client_ip_is_used_only_from_a_trusted_proxy() {
+        let proxy = "10.0.0.2".parse().unwrap();
+        let trusted = [proxy];
+        // The proxy appended the real client last; the first entry is whatever the client sent.
+        assert_eq!(client_ip(Some(proxy), Some("6.6.6.6, 203.0.113.7"), &trusted), "203.0.113.7");
+        // Anyone else's header is ignored: a client cannot pick its own rate-limit bucket.
+        assert_eq!(client_ip(Some("198.51.100.1".parse().unwrap()), Some("203.0.113.7"), &trusted), "198.51.100.1");
+        assert_eq!(client_ip(Some(proxy), Some("6.6.6.6"), &[]), "10.0.0.2");
+        // A trusted proxy that sent no usable header is counted as itself.
+        assert_eq!(client_ip(Some(proxy), None, &trusted), "10.0.0.2");
+        assert_eq!(client_ip(Some(proxy), Some("garbage"), &trusted), "10.0.0.2");
+    }
+}

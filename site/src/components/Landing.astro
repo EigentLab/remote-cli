@@ -1,0 +1,320 @@
+---
+// The landing page at /en/ and /vi/: one page, both languages from the copy below.
+import '@fontsource/chivo-mono/400.css';
+import '@fontsource/chivo-mono/500.css';
+import '@fontsource/chivo-mono/800.css';
+import '../styles/landing/page.css';
+import { Image } from 'astro:assets';
+import wordmark from '../../../assets/logo/wordmark.svg';
+import screen from '../assets/observation-screen.webp';
+import installSh from '../../../install.sh?raw';
+
+interface Props {
+	lang: 'en' | 'vi';
+}
+const { lang } = Astro.props;
+
+const version = installSh.match(/^VERSION=(.+)$/m)?.[1];
+// Shown in three parts that wrap between each other only, never inside "-fsSL" or "| sudo sh".
+const installParts = ['curl -fsSL', 'https://rcli.eigentlab.com/install.sh', '| sudo sh'];
+const install = installParts.join(' ');
+const github = 'https://github.com/EigentLab/remote-cli';
+const device = '123456789';
+
+const copy = {
+	en: {
+		title: 'rcli: remote control for AI agents',
+		description:
+			'rcli lets Claude Code and your scripts see the screen, click, type and run commands on your Windows, macOS and Linux Devices, through a Server you host.',
+		other: { lang: 'vi', href: '/vi/', label: 'Tiếng Việt' },
+		docs: 'Docs',
+		h1: 'Remote control for AI agents',
+		lede: 'Your AI agent sees, clicks, types and runs commands on your Devices.',
+		installLabel: 'Install a Server on Linux',
+		copy: 'Copy',
+		copied: 'Copied',
+		readDocs: 'Read the docs',
+		source: 'Source on GitHub',
+		screenAlt: 'A Linux desktop with a Software Updates dialog; rcli has numbered its controls 1 to 5.',
+		caption: 'What the agent gets back: every control numbered. Mark 5 is Install now.',
+		howHead: 'From your agent to the screen',
+		howLede: 'One rcli binary on each Device is both Controller and Agent.',
+		route: [
+			{ who: 'Your AI agent', what: 'Asks through rcli mcp, the CLI or the Dashboard.' },
+			{ who: 'Your Server', what: 'A Linux server you host. It relays every Action.' },
+			{ who: 'Your Devices', what: 'Windows, macOS or Linux. Its Agent acts and reports back.' },
+		],
+		boardHead: 'Every Action is one command',
+		boardLede: 'Add --json to any of them for scripts.',
+		boardCols: ['Command', 'What it does'],
+		board: [
+			['The screen, its controls numbered', `rcli shot ${device} --marks`],
+			['Click, type, scroll, by Mark or text', `rcli act ${device} click --text "Install now"`],
+			['A command, or rcli shell for a terminal', `rcli exec ${device} -- uptime`],
+			['Wake it through a Wake Relay on its LAN', `rcli wake ${device}`],
+			['One Controller at a time', `rcli lock acquire ${device}`],
+		],
+		claudeHead: 'Claude Code at the controls',
+		claudeSetup: 'Add it once, on a computer with rcli',
+		ask: `Install the waiting updates on ${device}.`,
+		answer: `Done: ${device} is up to date.`,
+		transcriptLabel: 'Example session',
+		hostHead: 'Your Server in one command',
+		hostLede: 'On Linux x86_64, with no domain name.',
+		hostFacts: [
+			['HTTPS on the IP address', 'Port 3443, from the Server’s own CA. Ports 80 and 443 stay free.'],
+			['Nothing to fill in', 'Docker, images, secrets and the first User.'],
+		],
+		modes: 'A domain, a Cloudflare Tunnel or a reverse proxy: --domain, --tunnel, --behind-proxy.',
+		outputLabel: 'From its output',
+		statement: 'Free software under the AGPL-3.0. You host every part of it.',
+		security: 'Security',
+		licence: 'Licence',
+	},
+	vi: {
+		title: 'rcli: điều khiển Device từ xa cho AI agent',
+		description:
+			'rcli cho Claude Code và script của bạn xem màn hình, click, gõ phím và chạy lệnh trên Device Windows, macOS và Linux, qua Server do bạn tự host.',
+		other: { lang: 'en', href: '/en/', label: 'English' },
+		docs: 'Tài liệu',
+		h1: 'Điều khiển Device từ xa cho AI agent',
+		lede: 'AI agent của bạn xem màn hình, click, gõ phím và chạy lệnh trên Device của bạn.',
+		installLabel: 'Cài Server trên Linux',
+		copy: 'Chép',
+		copied: 'Đã chép',
+		readDocs: 'Đọc tài liệu',
+		source: 'Mã nguồn trên GitHub',
+		screenAlt: 'Màn hình Linux có hộp thoại Software Updates; rcli đã đánh số các control từ 1 đến 5.',
+		caption: 'Thứ AI agent nhận về: mọi control được đánh số. Mark 5 là nút Install now.',
+		howHead: 'Từ AI agent tới màn hình',
+		howLede: 'Mỗi Device cài một binary rcli, vừa là Controller vừa là Agent.',
+		route: [
+			{ who: 'AI agent của bạn', what: 'Gọi qua rcli mcp, CLI hoặc Dashboard.' },
+			{ who: 'Server của bạn', what: 'Một máy chủ Linux bạn tự host. Chuyển tiếp mọi Action.' },
+			{ who: 'Device của bạn', what: 'Windows, macOS hoặc Linux. Agent trên Device làm theo và báo lại.' },
+		],
+		boardHead: 'Mỗi Action là một lệnh',
+		boardLede: 'Lệnh nào cũng nhận --json, cho script.',
+		boardCols: ['Lệnh', 'Làm gì'],
+		board: [
+			['Màn hình, các control được đánh số', `rcli shot ${device} --marks`],
+			['Click, gõ, cuộn, theo Mark hoặc chữ', `rcli act ${device} click --text "Install now"`],
+			['Một lệnh, hoặc rcli shell để mở terminal', `rcli exec ${device} -- uptime`],
+			['Đánh thức qua một Wake Relay cùng LAN', `rcli wake ${device}`],
+			['Mỗi lúc chỉ một Controller', `rcli lock acquire ${device}`],
+		],
+		claudeHead: 'Claude Code cầm lái',
+		claudeSetup: 'Thêm một lần, trên máy tính có rcli',
+		ask: `Cài các bản cập nhật đang chờ trên ${device}.`,
+		answer: `Xong: ${device} đã cập nhật đầy đủ.`,
+		transcriptLabel: 'Phiên ví dụ',
+		hostHead: 'Server của bạn, một lệnh',
+		hostLede: 'Trên Linux x86_64, không cần tên miền.',
+		hostFacts: [
+			['HTTPS trên địa chỉ IP', 'Cổng 3443, từ CA riêng của Server. Cổng 80 và 443 để nguyên.'],
+			['Không phải điền gì', 'Docker, image, secret và User đầu tiên.'],
+		],
+		modes: 'Có tên miền, Cloudflare Tunnel hoặc reverse proxy: --domain, --tunnel, --behind-proxy.',
+		outputLabel: 'Trích output của lệnh',
+		statement: 'Phần mềm tự do theo giấy phép AGPL-3.0. Bạn tự host mọi phần.',
+		security: 'Bảo mật',
+		licence: 'Giấy phép',
+	},
+}[lang];
+
+// Where rcli drew each Mark on the screen, in percent of the image (1366 x 1024).
+const marks = [
+	[1, 20.64, 31.93, 58.78, 35.94],
+	[2, 75.77, 33.2, 2.64, 3.32],
+	[3, 23.43, 50.59, 23.06, 3.52],
+	[4, 52.71, 59.28, 10.18, 5.66],
+	[5, 64.13, 59.28, 13.54, 5.66],
+];
+
+const docs = `/${lang}/usage/`;
+const transcript = [
+	['ask', `> ${copy.ask}`],
+	['call', `● rcli - lock_acquire(device: "${device}")`],
+	['call', `● rcli - observe(device: "${device}", marks: true)`],
+	['out', '  ⎿  5  button  "Install now"  in 1 "Software Updates"'],
+	['call', `● rcli - act(device: "${device}", action: {"type": "click", "mark": 5, "observation": 42})`],
+	['say', `● ${copy.answer}`],
+];
+---
+
+<!doctype html>
+<html lang={lang}>
+	<head>
+		<meta charset="utf-8" />
+		<meta name="viewport" content="width=device-width, initial-scale=1" />
+		<title>{copy.title}</title>
+		<meta name="description" content={copy.description} />
+		<link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+		<link rel="alternate" hreflang={copy.other.lang} href={new URL(copy.other.href, Astro.site)} />
+		<meta property="og:title" content={copy.title} />
+		<meta property="og:description" content={copy.description} />
+		<meta property="og:image" content="https://rcli.eigentlab.com/social-preview.png" />
+	</head>
+	<body>
+		<header class="nav">
+			<div class="container nav__bar">
+				<a class="nav__home" href={`/${lang}/`} aria-label="rcli">
+					<img src={wordmark.src} width="114" height="32" alt="" />
+				</a>
+				<nav class="nav__links" aria-label={copy.docs}>
+					<a href={docs}>{copy.docs}</a>
+					<a href={github}>GitHub</a>
+					<a href={copy.other.href} hreflang={copy.other.lang} lang={copy.other.lang}>{copy.other.label}</a>
+				</nav>
+			</div>
+		</header>
+
+		<main>
+			<section class="hero">
+				<div class="container hero__grid">
+					<div class="hero__text">
+						<h1>{copy.h1}</h1>
+						<p class="lead">{copy.lede}</p>
+						<div class="cmd">
+							<div class="cmd__row">
+								<code><span class="cmd__note"># {copy.installLabel}</span>{'\n'}<span class="nb">{installParts[0]}</span> {installParts[1]} <span class="nb">{installParts[2]}</span></code>
+								<button type="button" class="btn btn--primary" data-copy={install} data-done={copy.copied} hidden>
+									{copy.copy}
+								</button>
+							</div>
+						</div>
+						<div class="hero__links">
+							<a class="btn btn--outline" href={docs}>{copy.readDocs}</a>
+							<a class="textlink" href={github}>{copy.source}</a>
+						</div>
+					</div>
+					<figure class="obs">
+						<div class="obs__frame" data-slot="hero" data-kind="product" data-alt="an Observation from rcli shot --marks">
+							<Image src={screen} alt={copy.screenAlt} widths={[768, 1536]} sizes="(max-width: 60rem) 100vw, 760px" fetchpriority="high" loading="eager" />
+							<ol class="obs__marks" data-keep aria-hidden="true">
+								{marks.map(([n, x, y, w, h]) => (
+									<li style={`--x:${x}%;--y:${y}%;--w:${w}%;--h:${h}%`}><span>{n}</span></li>
+								))}
+							</ol>
+						</div>
+						<figcaption>
+							<code>rcli shot {device} --marks</code>
+							<span>{copy.caption}</span>
+						</figcaption>
+					</figure>
+				</div>
+			</section>
+
+			<section class="how">
+				<div class="container">
+					<div class="head">
+						<h2>{copy.howHead}</h2>
+						<p class="lead">{copy.howLede}</p>
+					</div>
+					<ol class="route">
+						{copy.route.map((r) => (
+							<li class="route__stop">
+								<h3>{r.who}</h3>
+								<p>{r.what}</p>
+							</li>
+						))}
+					</ol>
+				</div>
+			</section>
+
+			<section class="board">
+				<div class="container">
+					<div class="head head--split">
+						<h2>{copy.boardHead}</h2>
+						<p class="lead">{copy.boardLede}</p>
+					</div>
+					<table>
+						<thead>
+							<tr><th scope="col">{copy.boardCols[0]}</th><th scope="col">{copy.boardCols[1]}</th></tr>
+						</thead>
+						<tbody>
+							{copy.board.map(([what, cmd]) => (
+								<tr><td><code>{cmd}</code></td><td>{what}</td></tr>
+							))}
+						</tbody>
+					</table>
+				</div>
+			</section>
+
+			<section class="claude">
+				<div class="container claude__grid">
+					<div class="claude__text">
+						<h2>{copy.claudeHead}</h2>
+						<div class="setup">
+							<p class="cmd__label">{copy.claudeSetup}</p>
+							<pre><code>rcli connect {device}
+claude mcp add rcli -- rcli mcp</code></pre>
+						</div>
+					</div>
+					<figure class="plate transcript">
+						<figcaption>{copy.transcriptLabel}</figcaption>
+						<pre>{transcript.map(([kind, line]) => <span class={`t-${kind}`}>{line}{'\n'}</span>)}</pre>
+					</figure>
+				</div>
+			</section>
+
+			<section class="host">
+				<div class="container host__grid">
+					<div class="host__text">
+						<h2>{copy.hostHead}</h2>
+						<p class="lead">{copy.hostLede}</p>
+						<div class="cmd">
+							<div class="cmd__row">
+								<code><span class="nb">{installParts[0]}</span> {installParts[1]} <span class="nb">{installParts[2]}</span></code>
+								<button type="button" class="btn btn--primary" data-copy={install} data-done={copy.copied} hidden>
+									{copy.copy}
+								</button>
+							</div>
+						</div>
+						<dl class="facts">
+							{copy.hostFacts.map(([dt, dd]) => (
+								<div><dt>{dt}</dt><dd>{dd}</dd></div>
+							))}
+						</dl>
+						<p class="modes">{copy.modes}</p>
+					</div>
+					<figure class="plate output">
+						<figcaption>{copy.outputLabel}</figcaption>
+						<pre>{`rcli ${version} is running.
+
+  Dashboard:       https://203.0.113.7:3443
+  CA fingerprint:  4f1c…9a07
+  Name:            admin
+  Password:        ••••••••••••••••••••
+                   (shown once and not saved: write it down)`}</pre>
+					</figure>
+				</div>
+			</section>
+		</main>
+
+		<footer class="foot">
+			<div class="container">
+				<p class="foot__statement">{copy.statement}</p>
+				<ul class="foot__links">
+					<li><a href={docs}>{copy.docs}</a></li>
+					<li><a href={github}>GitHub</a></li>
+					<li><a href={`${github}/blob/main/SECURITY.md`}>{copy.security}</a></li>
+					<li><a href={`${github}/blob/main/LICENSE`}>{copy.licence} AGPL-3.0</a></li>
+					<li><a href={copy.other.href} hreflang={copy.other.lang} lang={copy.other.lang}>{copy.other.label}</a></li>
+				</ul>
+			</div>
+		</footer>
+
+		<script>
+			for (const b of document.querySelectorAll<HTMLButtonElement>('[data-copy]')) {
+				const label = b.textContent;
+				b.hidden = false;
+				b.addEventListener('click', async () => {
+					await navigator.clipboard.writeText(b.dataset.copy!);
+					b.textContent = b.dataset.done!;
+					setTimeout(() => (b.textContent = label), 2000);
+				});
+			}
+		</script>
+	</body>
+</html>

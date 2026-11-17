@@ -1,0 +1,257 @@
+//! Contract suite for the Platform port.
+//! It runs against any adapter: the FakePlatform in CI, a real OS adapter on a real Device with an operator
+//! following prompts. Each check yields one cell of a results table (rows = checks, columns = environments).
+
+use std::{
+    io::{Read, Write},
+    time::{Duration, Instant},
+};
+
+use crate::platform::{Input, Platform, PowerAction, Account, SessionState};
+
+/// Locally administered MAC that belongs to no real NIC, so the Wake check wakes nothing.
+pub const WAKE_TEST_MAC: [u8; 6] = [0x02, 0, 0, 0, 0, 0x27];
+/// Like the probe: how long a key may take to show up on screen.
+const SCREEN_CHANGE_TIMEOUT: Duration = Duration::from_secs(1);
+const LOCK_TIMEOUT: Duration = Duration::from_secs(3);
+const SHELL_TIMEOUT: Duration = Duration::from_secs(5);
+const CHECKS: [&str; 17] = [
+    "displays",
+    "capture",
+    "key shows on screen",
+    "text input",
+    "session state",
+    "control indicator",
+    "text recognition",
+    "accessibility tree",
+    "metrics",
+    "inventory",
+    "processes",
+    "shell",
+    "shell timeout",
+    "shell as root",
+    "pty",
+    "wake send",
+    "power lock",
+];
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Env {
+    LoggedIn,
+    LockScreen,
+    LoginScreen,
+}
+
+const ENVS: [Env; 3] = [Env::LoggedIn, Env::LockScreen, Env::LoginScreen];
+
+/// What the suite asks the person at the Device to do.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Step {
+    FocusTextField,
+    Lock,
+    Unlock,
+    LogOut,
+    LogIn,
+}
+
+impl Step {
+    pub fn instruction(self) -> &'static str {
+        match self {
+            Step::FocusTextField => "Click into an empty text field (the suite types the key `a`).",
+            Step::Lock => "Lock the screen now.",
+            Step::Unlock => "Delete the typed dots from the password field, then unlock.",
+            Step::LogOut => "Log out now and stay at the login screen.",
+            Step::LogIn => "Delete the typed dots from the password field, then log in.",
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct Report {
+    rows: Vec<(&'static str, Env, Result<(), String>)>,
+}
+
+impl Report {
+    fn check(&mut self, name: &'static str, env: Env, f: impl FnOnce() -> anyhow::Result<()>) {
+        self.rows.push((name, env, f().map_err(|e| e.to_string())));
+    }
+
+    /// Failed checks in the order they ran.
+    pub fn failures(&self) -> Vec<(&'static str, Env)> {
+        self.rows.iter().filter(|r| r.2.is_err()).map(|r| (r.0, r.1)).collect()
+    }
+
+    /// Markdown table like the lockscreen probe README's.
+    pub fn table(&self) -> String {
+        let mut out = String::from("| Check | Logged in | Lock screen | Login screen |\n|---|---|---|---|\n");
+        for check in CHECKS {
+            out += &format!("| {check} |");
+            for env in ENVS {
+                match self.rows.iter().find(|r| r.0 == check && r.1 == env) {
+                    None => out += " |",
+                    Some((_, _, Ok(()))) => out += " ✅ |",
+                    Some((_, _, Err(e))) => out += &format!(" ❌ {} |", e.replace('|', "/")),
+                }
+            }
+            out += "\n";
+        }
+        out
+    }
+}
+
+/// Runs every check; `operator` must have done each Step before it returns.
+pub fn run(p: &dyn Platform, operator: &mut dyn FnMut(Step)) -> Report {
+    let mut r = Report::default();
+    r.check("displays", Env::LoggedIn, || {
+        let displays = p.displays()?;
+        anyhow::ensure!(displays.iter().filter(|d| d.primary).count() == 1, "need exactly one primary display: {displays:?}");
+        for d in displays {
+            let f = p.capture(d.index)?;
+            anyhow::ensure!((f.width, f.height) == (d.width, d.height), "display {} captured as {}x{}", d.index, f.width, f.height);
+        }
+        Ok(())
+    });
+    operator(Step::FocusTextField);
+    screen_checks(p, Env::LoggedIn, SessionState::LoggedIn, &mut r);
+    r.check("accessibility tree", Env::LoggedIn, || {
+        let tree = p.accessibility(primary(p)?)?.ok_or_else(|| anyhow::anyhow!("no accessibility tree"))?;
+        anyhow::ensure!(!tree.is_empty(), "accessibility tree has no elements");
+        Ok(())
+    });
+    r.check("metrics", Env::LoggedIn, || {
+        let m = p.metrics()?;
+        let cpu = m.cpu_percent.unwrap_or(-1.0);
+        anyhow::ensure!((0.0..=100.0).contains(&cpu), "cpu {cpu}% missing or out of range");
+        anyhow::ensure!(m.ram_used_bytes.unwrap_or(0) > 0, "ram used missing or 0");
+        Ok(())
+    });
+    r.check("inventory", Env::LoggedIn, || {
+        let i = p.inventory()?;
+        anyhow::ensure!(!i.os.is_empty() && !i.hostname.is_empty() && i.cpu_cores > 0, "incomplete {i:?}");
+        Ok(())
+    });
+    r.check("processes", Env::LoggedIn, || {
+        anyhow::ensure!(!p.processes()?.is_empty(), "no processes");
+        Ok(())
+    });
+    r.check("shell", Env::LoggedIn, || {
+        let out = p.shell("echo rcli-contract", me(), SHELL_TIMEOUT)?;
+        anyhow::ensure!(out.exit_code == 0 && out.stdout.trim() == "rcli-contract", "unexpected {out:?}");
+        Ok(())
+    });
+    r.check("shell timeout", Env::LoggedIn, || {
+        let start = Instant::now();
+        let out = p.shell("sleep 30", me(), Duration::from_secs(1))?;
+        anyhow::ensure!(out.timed_out, "not reported as timed out: {out:?}");
+        anyhow::ensure!(start.elapsed() < SHELL_TIMEOUT, "not killed in time: took {:?}", start.elapsed());
+        Ok(())
+    });
+    r.check("pty", Env::LoggedIn, || {
+        let mut pty = p.pty(me(), 80, 24)?;
+        pty.control.resize(100, 30)?;
+        pty.input.write_all(b"echo rcli-contract\rexit 3\r")?;
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut output = pty.output;
+        std::thread::spawn(move || {
+            let mut text = vec![];
+            let _ = output.read_to_end(&mut text);
+            let _ = tx.send(text);
+        });
+        let Ok(text) = rx.recv_timeout(SHELL_TIMEOUT) else {
+            pty.control.kill()?;
+            anyhow::bail!("shell did not exit after `exit 3`");
+        };
+        let text = String::from_utf8_lossy(&text);
+        // The typed line is echoed once; the output makes a second occurrence.
+        anyhow::ensure!(text.matches("rcli-contract").count() >= 2, "no echo output in {text:?}");
+        let code = pty.control.wait()?;
+        anyhow::ensure!(code == 3, "exit code {code}, expected 3");
+        Ok(())
+    });
+    r.check("wake send", Env::LoggedIn, || p.send_wake(WAKE_TEST_MAC));
+
+    operator(Step::Lock);
+    screen_checks(p, Env::LockScreen, SessionState::Locked, &mut r);
+    operator(Step::Unlock);
+
+    operator(Step::LogOut);
+    screen_checks(p, Env::LoginScreen, SessionState::LoginScreen, &mut r);
+    r.check("shell as root", Env::LoginScreen, || {
+        let out = p.shell("whoami", Account::Root, SHELL_TIMEOUT)?;
+        let who = out.stdout.trim().to_lowercase();
+        anyhow::ensure!(out.exit_code == 0 && (who == "root" || who.ends_with("\\system")), "unexpected {out:?}");
+        Ok(())
+    });
+    operator(Step::LogIn);
+
+    r.check("power lock", Env::LoggedIn, || {
+        p.power(PowerAction::Lock)?;
+        wait_for_state(p, SessionState::Locked, LOCK_TIMEOUT)
+    });
+    operator(Step::Unlock);
+    r
+}
+
+fn screen_checks(p: &dyn Platform, env: Env, expected: SessionState, r: &mut Report) {
+    r.check("capture", env, || {
+        let f = p.capture(primary(p)?)?;
+        anyhow::ensure!(f.width > 0 && f.height > 0, "empty frame");
+        anyhow::ensure!(f.rgba.len() == (f.width * f.height * 4) as usize, "frame size mismatch");
+        Ok(())
+    });
+    r.check("key shows on screen", env, || {
+        let primary = primary(p)?;
+        let before = p.capture(primary)?;
+        p.input(Input::Key("a".into()))?;
+        let start = Instant::now();
+        while p.capture(primary)? == before {
+            anyhow::ensure!(start.elapsed() < SCREEN_CHANGE_TIMEOUT, "screen did not change after the key");
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        Ok(())
+    });
+    // Typed text is a different path (a keymap with Shift on Wayland's uinput), so it gets its own check.
+    r.check("text input", env, || {
+        let primary = primary(p)?;
+        let before = p.capture(primary)?;
+        p.input(Input::Text("rcli".into()))?;
+        let start = Instant::now();
+        while p.capture(primary)? == before {
+            anyhow::ensure!(start.elapsed() < SCREEN_CHANGE_TIMEOUT, "screen did not change after the text");
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        Ok(())
+    });
+    r.check("session state", env, || wait_for_state(p, expected, Duration::ZERO));
+    // shortcut: only checks that show/hide succeed here; whether it is visible is checked by eye on a real Device.
+    r.check("control indicator", env, || {
+        p.set_control_indicator(true)?;
+        p.set_control_indicator(false)
+    });
+    // Every screen shows some text (a clock, a user name), and OCR is the Mark fallback where there is no tree.
+    r.check("text recognition", env, || {
+        anyhow::ensure!(!p.recognize_text(&p.capture(primary(p)?)?)?.is_empty(), "no text recognized");
+        Ok(())
+    });
+}
+
+/// The account running the suite: on a real Device the Terminal User must be an account that exists.
+fn me() -> Account {
+    Account::User(std::env::var("USER").or_else(|_| std::env::var("USERNAME")).unwrap_or_else(|_| "user".into()))
+}
+
+fn primary(p: &dyn Platform) -> anyhow::Result<u32> {
+    p.displays()?.iter().find(|d| d.primary).map(|d| d.index).ok_or_else(|| anyhow::anyhow!("no primary display"))
+}
+
+fn wait_for_state(p: &dyn Platform, expected: SessionState, timeout: Duration) -> anyhow::Result<()> {
+    let start = Instant::now();
+    loop {
+        let got = p.session_state()?;
+        if got == expected {
+            return Ok(());
+        }
+        anyhow::ensure!(start.elapsed() < timeout, "reported {got:?}, expected {expected:?}");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}

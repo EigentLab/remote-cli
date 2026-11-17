@@ -1,0 +1,1084 @@
+//! Platform adapter for Windows 10/11, run inside the logged-in user's session (ticket 21).
+//! Capture: xcap (GDI). Input: enigo. Accessibility: UI Automation. OCR: Windows.Media.Ocr.
+//! Inventory, metrics and processes: sysinfo. Shell: PowerShell. PTY: ConPTY through portable-pty.
+// shortcut: crates.io xcap/enigo instead of RustDesk's git scrap/enigo (ADR 0002): RustDesk's scrap needs vcpkg
+// libvpx/aom/libyuv plus the hbb_common submodule. Switch when ticket 22 brings the SYSTEM service and a Windows build host.
+
+use std::{
+    cell::RefCell,
+    io::Read,
+    os::windows::process::CommandExt,
+    process::{Command, Stdio},
+    sync::{Arc, Condvar, Mutex},
+    time::{Duration, Instant},
+};
+
+use enigo::{Axis, Direction, Enigo, Keyboard, Mouse, Settings};
+use portable_pty::{CommandBuilder, MasterPty, PtySize};
+use windows::{
+    core::{Interface, BOOL},
+    Graphics::Imaging::{BitmapPixelFormat, SoftwareBitmap},
+    Media::Ocr::OcrEngine,
+    Security::Cryptography::CryptographicBuffer,
+    Win32::{
+        Foundation::{HANDLE, HWND, LPARAM, POINT, RECT},
+        Security::Authentication::Identity::SendSAS,
+        System::{
+            Com::{CoCreateInstance, CoInitializeEx, CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED},
+            Power::{GetSystemPowerStatus, SYSTEM_POWER_STATUS},
+            RemoteDesktop::{
+                WTSFreeMemory, WTSGetActiveConsoleSessionId, WTSQuerySessionInformationW, WTSSessionInfoEx, WTSINFOEXW,
+                WTS_CURRENT_SERVER_HANDLE,
+            },
+            StationsAndDesktops::{
+                CloseDesktop, GetUserObjectInformationW, OpenInputDesktop, SetThreadDesktop, DESKTOP_ACCESS_FLAGS, DESKTOP_ENUMERATE,
+                DESKTOP_READOBJECTS, DESKTOP_SWITCHDESKTOP, DESKTOP_WRITEOBJECTS, DF_ALLOWOTHERACCOUNTHOOK, HDESK, UOI_NAME,
+            },
+            Variant::VARIANT,
+        },
+        UI::{
+            Accessibility::*,
+            HiDpi::{SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2},
+            Input::KeyboardAndMouse::{
+                IsWindowEnabled, SendInput, INPUT, INPUT_0, INPUT_MOUSE, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_MOVE, MOUSEEVENTF_VIRTUALDESK,
+                MOUSEINPUT,
+            },
+            WindowsAndMessaging::{
+                EnumWindows, GetAncestor, GetClassNameW, GetForegroundWindow, GetSystemMetrics, GetWindow, GetWindowLongW, GetWindowRect,
+                GetWindowThreadProcessId, IsWindowVisible, WindowFromPoint, GA_ROOT, GWL_STYLE, GW_OWNER, SM_CXVIRTUALSCREEN,
+                SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, STATE_SYSTEM_CHECKED, STATE_SYSTEM_COLLAPSED,
+                STATE_SYSTEM_EXPANDED, STATE_SYSTEM_FOCUSED, STATE_SYSTEM_PROTECTED, STATE_SYSTEM_SELECTED, WS_POPUP,
+            },
+        },
+    },
+};
+
+use crate::platform::*;
+
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+/// Makes PowerShell's redirected output UTF-8 instead of the OEM code page.
+const UTF8: &str = "[Console]::OutputEncoding=[Text.Encoding]::UTF8;";
+/// PowerShell exits 1 when the last command failed; this passes a failed program's own exit code through instead.
+const EXIT_CODE: &str = "if (-not $?) { if ($LASTEXITCODE) { exit $LASTEXITCODE } else { exit 1 } }";
+
+pub struct WindowsPlatform {
+    /// The Device name `rcli agent run --name` registers with.
+    name: String,
+    system: Mutex<Sampler>,
+}
+
+/// sysinfo state kept between samples: CPU, disk and network figures are deltas since the previous refresh.
+struct Sampler {
+    system: sysinfo::System,
+    disks: sysinfo::Disks,
+    networks: sysinfo::Networks,
+    users: sysinfo::Users,
+    last: Instant,
+}
+
+impl WindowsPlatform {
+    pub fn new(name: impl Into<String>) -> anyhow::Result<Self> {
+        // Real pixels everywhere: monitor sizes, capture, the mouse and UI Automation boxes.
+        unsafe {
+            let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+        }
+        let sampler = Sampler {
+            system: sysinfo::System::new_all()?,
+            disks: sysinfo::Disks::new_with_refreshed_list()?,
+            networks: sysinfo::Networks::new_with_refreshed_list()?,
+            users: sysinfo::Users::new_with_refreshed_list()?,
+            last: Instant::now(),
+        };
+        Ok(Self { name: name.into(), system: Mutex::new(sampler) })
+    }
+
+    fn display(&self, index: u32) -> anyhow::Result<DisplayInfo> {
+        self.displays()?.into_iter().find(|d| d.index == index).ok_or_else(|| anyhow::anyhow!("no display {index}"))
+    }
+
+    // shortcut: the foreground window (or, if it is not on `display`, the window at the display's centre) plus its
+    // process's popups, menus and dialogs; other apps' windows are not walked. Walk them if Marks miss things there.
+    /// The targetable elements of `display` with their UIA elements; `None` when no window answered.
+    fn uia_tree(&self, display: u32) -> anyhow::Result<Option<Vec<(UiElement, IUIAutomationElement)>>> {
+        switch_to_input_desktop()?;
+        let d = self.display(display)?;
+        com_init();
+        unsafe {
+            let uia: IUIAutomation2 = CoCreateInstance(&CUIAutomation8, None, CLSCTX_INPROC_SERVER)?;
+            // A hung app makes UIA calls fail after these instead of stalling the request.
+            uia.SetConnectionTimeout(2000)?;
+            uia.SetTransactionTimeout(5000)?;
+            let mut window = GetForegroundWindow();
+            if window.is_invalid() || !overlaps(window_rect(window), &d) {
+                let centre = POINT { x: d.x + d.width as i32 / 2, y: d.y + d.height as i32 / 2 };
+                window = GetAncestor(WindowFromPoint(centre), GA_ROOT);
+            }
+            if window.is_invalid() {
+                return Ok(Some(vec![]));
+            }
+            // One cached request per window fetches the whole visible subtree with every property read below.
+            let cache = uia.CreateCacheRequest()?;
+            for property in CACHED {
+                cache.AddProperty(property)?;
+            }
+            cache.SetTreeScope(TreeScope_Subtree)?;
+            cache.SetTreeFilter(&uia.CreatePropertyCondition(UIA_IsOffscreenPropertyId, &VARIANT::from(false))?)?;
+            let (mut elements, mut budget, mut read) = (vec![], UIA_MAX_NODES, false);
+            for w in scope(window, &d) {
+                // A window that timed out or closed adds no Marks; the others still do.
+                let Ok(root) = uia.ElementFromHandle(w).and_then(|e| e.BuildUpdatedCache(&cache)) else {
+                    continue;
+                };
+                read = true;
+                walk(root, &d, &mut elements, &mut budget)?;
+            }
+            // No window answered: OCR Marks instead.
+            Ok(read.then_some(elements))
+        }
+    }
+}
+
+impl Platform for WindowsPlatform {
+    fn hostname(&self) -> String {
+        self.name.clone()
+    }
+
+    fn displays(&self) -> anyhow::Result<Vec<DisplayInfo>> {
+        Ok(xcap::Monitor::all()?
+            .iter()
+            .zip(0..)
+            .map(|(m, index)| DisplayInfo {
+                index,
+                x: m.x().unwrap_or(0),
+                y: m.y().unwrap_or(0),
+                width: m.width().unwrap_or(0),
+                height: m.height().unwrap_or(0),
+                scale: m.scale_factor().unwrap_or(1.0).into(),
+                primary: m.is_primary().unwrap_or(false),
+            })
+            .collect())
+    }
+
+    fn capture(&self, display: u32) -> anyhow::Result<Frame> {
+        // The input desktop changes on lock, login and a UAC prompt; GDI captures whatever desktop this thread is
+        // on, so follow the input desktop first (the session helper runs as SYSTEM in the console session).
+        switch_to_input_desktop()?;
+        let monitor = xcap::Monitor::all()?.into_iter().nth(display as usize).ok_or_else(|| anyhow::anyhow!("no display {display}"))?;
+        let image = monitor.capture_image()?;
+        Ok(Frame { width: image.width(), height: image.height(), rgba: image.into_raw() })
+    }
+
+    fn input(&self, input: Input) -> anyhow::Result<()> {
+        // Ctrl+Alt+Del is the secure attention sequence: Windows produces it only through SendSAS, from the SYSTEM
+        // helper in the console session (`asuser = false`), and only when the software-SAS policy allows it.
+        if input == Input::Sas {
+            anyhow::ensure!(running_as_system(), "Ctrl+Alt+Del {}", crate::platform::SERVICE_MODE_NEEDED);
+            unsafe { SendSAS(false) };
+            return Ok(());
+        }
+        switch_to_input_desktop()?;
+        // A fresh Enigo per primitive: held keys must stay down between KeyDown and KeyUp calls.
+        let mut enigo = Enigo::new(&Settings { release_keys_when_dropped: false, ..Default::default() })?;
+        match input {
+            Input::Move { display, x, y } => {
+                let d = self.display(display)?;
+                move_pointer(d.x + x as i32, d.y + y as i32)?;
+            }
+            Input::Press { button, down } => {
+                let button = match button {
+                    Button::Left => enigo::Button::Left,
+                    Button::Right => enigo::Button::Right,
+                    Button::Middle => enigo::Button::Middle,
+                };
+                enigo.button(button, if down { Direction::Press } else { Direction::Release })?;
+            }
+            Input::Scroll { dx, dy } => {
+                if dy != 0 {
+                    enigo.scroll(dy, Axis::Vertical)?;
+                }
+                if dx != 0 {
+                    enigo.scroll(dx, Axis::Horizontal)?;
+                }
+            }
+            Input::Text(text) => enigo.text(&text)?,
+            Input::Key(name) => enigo.key(key(&name)?, Direction::Click)?,
+            Input::KeyDown(name) => enigo.key(key(&name)?, Direction::Press)?,
+            Input::KeyUp(name) => enigo.key(key(&name)?, Direction::Release)?,
+            Input::Sas => unreachable!("handled before the input desktop switch"),
+        }
+        Ok(())
+    }
+
+    fn accessibility(&self, display: u32) -> anyhow::Result<Option<Vec<UiElement>>> {
+        Ok(self.uia_tree(display)?.map(|tree| tree.into_iter().map(|(e, _)| e).collect()))
+    }
+
+    fn ui_action(&self, display: u32, element: &UiElement, action: &UiAction) -> anyhow::Result<bool> {
+        let tree = self.uia_tree(display)?.ok_or_else(|| anyhow::anyhow!("no window answers UI Automation; observe again"))?;
+        let (found, e) = UiElement::find(&tree, element)
+            .ok_or_else(|| anyhow::anyhow!("no {} {:?} on screen any more; observe again", element.role, element.text))?;
+        uia_perform(found, e, action)
+    }
+
+    fn recognize_text(&self, frame: &Frame) -> anyhow::Result<Vec<UiElement>> {
+        com_init();
+        let engine = OcrEngine::TryCreateFromUserProfileLanguages()?;
+        // OCR refuses images larger than MaxImageDimension (about 2600 px): scale down, then scale the boxes back up.
+        let max = OcrEngine::MaxImageDimension()?;
+        let scale = (frame.width.max(frame.height) as f32 / max as f32).max(1.0);
+        let image = image::RgbaImage::from_raw(frame.width, frame.height, frame.rgba.clone())
+            .ok_or_else(|| anyhow::anyhow!("frame size mismatch"))?;
+        let image = if scale > 1.0 {
+            let (w, h) = ((frame.width as f32 / scale) as u32, (frame.height as f32 / scale) as u32);
+            image::imageops::resize(&image, w, h, image::imageops::FilterType::Triangle)
+        } else {
+            image
+        };
+        let (w, h) = image.dimensions();
+        let mut bgra = image.into_raw();
+        bgra.as_chunks_mut::<4>().0.iter_mut().for_each(|p| p.swap(0, 2));
+        let buffer = CryptographicBuffer::CreateFromByteArray(&bgra)?;
+        let bitmap = SoftwareBitmap::CreateCopyFromBuffer(&buffer, BitmapPixelFormat::Bgra8, w as i32, h as i32)?;
+        let result = engine.RecognizeAsync(&bitmap)?.join()?;
+        let mut lines = vec![];
+        for line in result.Lines()? {
+            let (mut x1, mut y1, mut x2, mut y2) = (f32::MAX, f32::MAX, 0f32, 0f32);
+            for word in line.Words()? {
+                let r = word.BoundingRect()?;
+                (x1, y1, x2, y2) = (x1.min(r.X), y1.min(r.Y), x2.max(r.X + r.Width), y2.max(r.Y + r.Height));
+            }
+            if x2 > x1 && y2 > y1 {
+                let px = |v: f32| (v * scale).round() as u32;
+                let (x, y) = (px(x1), px(y1));
+                let text = line.Text()?.to_string();
+                lines.push(UiElement { role: "text".into(), text, x, y, width: px(x2) - x, height: px(y2) - y, ..Default::default() });
+            }
+        }
+        Ok(lines)
+    }
+
+    fn session_state(&self) -> anyhow::Result<SessionState> {
+        let (user, locked) = console_session()?;
+        Ok(match (user.is_empty(), locked) {
+            (true, _) => SessionState::LoginScreen,
+            (false, true) => SessionState::Locked,
+            (false, false) => SessionState::LoggedIn,
+        })
+    }
+
+    fn inventory(&self) -> anyhow::Result<Inventory> {
+        let s = self.system.lock().unwrap();
+        let interfaces = s
+            .networks
+            .iter()
+            .map(|(name, n)| NetworkInterface {
+                name: name.to_string_lossy().into(),
+                mac: n.mac_address().to_string(),
+                ips: n.ip_networks().iter().map(|ip| format!("{}/{}", ip.addr, ip.prefix)).collect(),
+            })
+            .collect();
+        // shortcut: no GPUs or serial number (they need WMI); add them when the Dashboard shows them.
+        Ok(Inventory {
+            os: sysinfo::System::name().unwrap_or_else(|_| "Windows".into()),
+            os_version: sysinfo::System::long_os_version().unwrap_or_default(),
+            hostname: sysinfo::System::host_name().unwrap_or_default(),
+            cpu_model: s.system.cpus().first().map(|c| c.brand().trim().to_owned()).unwrap_or_default(),
+            cpu_cores: s.system.cpus().len() as u32,
+            ram_bytes: s.system.total_memory(),
+            disks: s
+                .disks
+                .iter()
+                .map(|d| Disk {
+                    name: d.name().to_string_lossy().into(),
+                    mount: d.mount_point().to_string_lossy().into(),
+                    total_bytes: d.total_space(),
+                })
+                .collect(),
+            network_interfaces: interfaces,
+            displays: xcap::Monitor::all()?
+                .iter()
+                .map(|m| Display { name: m.name().unwrap_or_default(), width: m.width().unwrap_or(0), height: m.height().unwrap_or(0) })
+                .collect(),
+            ..Default::default()
+        })
+    }
+
+    fn metrics(&self) -> anyhow::Result<Resources> {
+        let mut guard = self.system.lock().unwrap();
+        let s = &mut *guard;
+        if s.last.elapsed() < sysinfo::MINIMUM_CPU_UPDATE_INTERVAL {
+            std::thread::sleep(sysinfo::MINIMUM_CPU_UPDATE_INTERVAL);
+        }
+        let secs = s.last.elapsed().as_secs_f64();
+        s.last = Instant::now();
+        s.system.refresh_cpu_usage();
+        s.system.refresh_memory();
+        s.disks.refresh(true);
+        s.networks.refresh(true);
+        let per_sec = |bytes: u64| Some((bytes as f64 / secs) as u64);
+        let (user, _) = console_session().unwrap_or_default();
+        let mut power = SYSTEM_POWER_STATUS::default();
+        // BatteryFlag 128 = no battery; 255 = unknown percentage.
+        let battery =
+            unsafe { GetSystemPowerStatus(&mut power) }.is_ok() && power.BatteryFlag & 128 == 0 && power.BatteryLifePercent <= 100;
+        Ok(Resources {
+            cpu_percent: Some(s.system.global_cpu_usage().into()),
+            ram_used_bytes: Some(s.system.used_memory()),
+            disk_used_percent: s
+                .disks
+                .iter()
+                .filter(|d| d.total_space() > 0)
+                .map(|d| {
+                    let used = d.total_space() - d.available_space();
+                    (d.mount_point().to_string_lossy().into(), used as f64 * 100.0 / d.total_space() as f64)
+                })
+                .collect(),
+            disk_read_bytes_per_sec: per_sec(s.disks.iter().map(|d| d.usage().read_bytes).sum()),
+            disk_write_bytes_per_sec: per_sec(s.disks.iter().map(|d| d.usage().written_bytes).sum()),
+            net_up_bytes_per_sec: per_sec(s.networks.values().map(|n| n.transmitted()).sum()),
+            net_down_bytes_per_sec: per_sec(s.networks.values().map(|n| n.received()).sum()),
+            uptime_secs: sysinfo::System::uptime().ok(),
+            logged_in_user: Some(user),
+            battery_percent: battery.then_some(power.BatteryLifePercent.into()),
+            battery_charging: battery.then_some(power.ACLineStatus == 1),
+            ..Default::default()
+        })
+    }
+
+    fn processes(&self) -> anyhow::Result<Vec<Process>> {
+        let mut guard = self.system.lock().unwrap();
+        let s = &mut *guard;
+        s.system.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
+        Ok(s.system
+            .processes()
+            .values()
+            .map(|p| Process {
+                pid: p.pid().as_u32(),
+                name: p.name().to_string_lossy().into(),
+                user: p.user_id().and_then(|id| s.users.get_user_by_id(id)).map(|u| u.name().to_owned()).unwrap_or_default(),
+                cpu_percent: p.cpu_usage().into(),
+                memory_bytes: p.memory(),
+            })
+            .collect())
+    }
+
+    // shortcut: runs as the account the Agent runs as, whatever `account` says (a user-session Agent cannot switch
+    // accounts); ticket 22's SYSTEM service starts it as the Terminal User or SYSTEM.
+    fn shell(&self, command: &str, _run_as: Account, timeout: Duration) -> anyhow::Result<ShellOutput> {
+        let mut child = Command::new("powershell.exe")
+            .args(["-NoProfile", "-NonInteractive", "-EncodedCommand", &encode(&format!("{UTF8}{command}\n{EXIT_CODE}"))])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .creation_flags(CREATE_NO_WINDOW)
+            .spawn()?;
+        let read = |mut r: Box<dyn Read + Send>| {
+            std::thread::spawn(move || {
+                let mut out = vec![];
+                let _ = r.read_to_end(&mut out);
+                String::from_utf8_lossy(&out).into_owned()
+            })
+        };
+        let stdout = read(Box::new(child.stdout.take().unwrap()));
+        let stderr = read(Box::new(child.stderr.take().unwrap()));
+        let start = Instant::now();
+        let (code, timed_out) = loop {
+            if let Some(status) = child.try_wait()? {
+                break (status.code().unwrap_or(-1), false);
+            }
+            if start.elapsed() >= timeout {
+                kill_tree(child.id());
+                break (child.wait()?.code().unwrap_or(-1), true);
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        let join = |t: std::thread::JoinHandle<String>| t.join().unwrap_or_default();
+        Ok(ShellOutput { exit_code: code, stdout: join(stdout), stderr: join(stderr), timed_out })
+    }
+
+    // shortcut: same account rule as `shell`.
+    fn pty(&self, _run_as: Account, cols: u16, rows: u16) -> anyhow::Result<Pty> {
+        let pair = portable_pty::native_pty_system().openpty(size(cols, rows))?;
+        let mut cmd = CommandBuilder::new("powershell.exe");
+        cmd.arg("-NoLogo");
+        if let Some(home) = std::env::var_os("USERPROFILE") {
+            cmd.cwd(home);
+        }
+        let mut child = pair.slave.spawn_command(cmd)?;
+        drop(pair.slave);
+        let output = pair.master.try_clone_reader()?;
+        let input = pair.master.take_writer()?;
+        let pid = child.process_id();
+        let master = Arc::new(Mutex::new(Some(pair.master)));
+        let exit = Arc::new((Mutex::new(None), Condvar::new()));
+        let (m, e) = (master.clone(), exit.clone());
+        // ConPTY never ends the output on its own: closing the pseudo console once the shell exits makes the EOF.
+        std::thread::spawn(move || {
+            let code = child.wait().map(|s| s.exit_code() as i32).unwrap_or(-1);
+            m.lock().unwrap().take();
+            *e.0.lock().unwrap() = Some(code);
+            e.1.notify_all();
+        });
+        Ok(Pty { output, input, control: Box::new(ConPty { master, exit, pid }) })
+    }
+
+    fn power(&self, action: PowerAction) -> anyhow::Result<()> {
+        let (program, args): (&str, &[&str]) = match action {
+            PowerAction::Restart => ("shutdown.exe", &["/r", "/t", "0"]),
+            PowerAction::Shutdown => ("shutdown.exe", &["/s", "/t", "0"]),
+            // .NET enables the shutdown privilege that SetSuspendState needs.
+            PowerAction::Sleep => (
+                "powershell.exe",
+                &["-NoProfile", "-Command", "Add-Type -AssemblyName System.Windows.Forms;[void][System.Windows.Forms.Application]::SetSuspendState('Suspend',$false,$false)"],
+            ),
+            PowerAction::Lock => ("rundll32.exe", &["user32.dll,LockWorkStation"]),
+        };
+        let out = Command::new(program).args(args).creation_flags(CREATE_NO_WINDOW).output()?;
+        anyhow::ensure!(out.status.success(), "{action:?} failed: {}", String::from_utf8_lossy(&out.stderr).trim());
+        Ok(())
+    }
+
+    fn send_wake(&self, mac: [u8; 6]) -> anyhow::Result<()> {
+        let socket = std::net::UdpSocket::bind("0.0.0.0:0")?;
+        socket.set_broadcast(true)?;
+        socket.send_to(&magic_packet(mac), "255.255.255.255:9")?;
+        Ok(())
+    }
+
+    /// A running .exe cannot be overwritten but can be renamed: move it aside, write the new one, start it with the
+    /// same arguments and exit.
+    // shortcut: restarts as a plain child process; the Service Mode service (ticket 15) should restart through the
+    // service manager instead if a lost child ever leaves it stopped.
+    fn install_update(&self, _version: &str, build: &std::path::Path) -> anyhow::Result<()> {
+        let exe = std::env::current_exe()?;
+        let old = exe.with_extension("old.exe");
+        let _ = std::fs::remove_file(&old);
+        std::fs::rename(&exe, &old)?;
+        if let Err(e) = std::fs::copy(build, &exe) {
+            let _ = std::fs::rename(&old, &exe);
+            return Err(e.into());
+        }
+        // This process exits below, so nobody else is left to delete the download.
+        let _ = std::fs::remove_file(build);
+        Command::new(&exe).args(std::env::args_os().skip(1)).spawn()?;
+        std::process::exit(0);
+    }
+
+    // shortcut: no indicator of its own; in the desktop build the GUI window is the indicator (gui::WindowPlatform).
+    // Add one for Service Mode (ticket 15) if it must also show at the lock and login screens.
+    fn set_control_indicator(&self, _on: bool) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// Not SYSTEM: the User Mode Agent in the user's own session, started from their Run key (ADR 0012).
+    fn user_mode(&self) -> Option<String> {
+        (!running_as_system()).then(|| std::env::var("USERNAME").unwrap_or_default())
+    }
+
+    /// Without the GUI there is nobody to ask: reject (the desktop build's window asks instead).
+    fn ask_root(&self, _requester: &str, _timeout: Duration) -> anyhow::Result<bool> {
+        Ok(false)
+    }
+
+    fn ask_accept(&self, _requester: &str, _timeout: Duration) -> anyhow::Result<bool> {
+        Ok(false)
+    }
+
+    /// `password` is checked by a logon as this account; with `None` the Windows credential prompt asks for this
+    /// account's password and the logon checks what was typed (ADR 0013).
+    fn authenticate(&self, reason: &str, password: Option<&str>) -> anyhow::Result<bool> {
+        match password {
+            Some(password) => Ok(logs_on_as_me(&std::env::var("USERNAME")?, &std::env::var("USERDOMAIN").unwrap_or_default(), password)),
+            None => credential_prompt(reason),
+        }
+    }
+}
+
+/// Whether `user`, `domain` and `password` log on (`LogonUserW`) as the account this process runs as.
+fn logs_on_as_me(user: &str, domain: &str, password: &str) -> bool {
+    use windows::Win32::{
+        Foundation::CloseHandle,
+        Security::{LogonUserW, LOGON32_LOGON_INTERACTIVE, LOGON32_PROVIDER_DEFAULT},
+    };
+    let wide = |s: &str| s.encode_utf16().chain(std::iter::once(0)).collect::<Vec<u16>>();
+    let (user, domain, mut password) = (wide(user), wide(domain), wide(password));
+    let mut token = HANDLE::default();
+    let domain = if domain.len() > 1 { windows::core::PCWSTR(domain.as_ptr()) } else { windows::core::PCWSTR::null() };
+    let logged_on = unsafe {
+        LogonUserW(windows::core::PCWSTR(user.as_ptr()), domain, windows::core::PCWSTR(password.as_ptr()), LOGON32_LOGON_INTERACTIVE, LOGON32_PROVIDER_DEFAULT, &mut token)
+    };
+    password.fill(0);
+    if logged_on.is_err() {
+        return false;
+    }
+    // Another account's password logs on too: only this account's counts.
+    let same = crate::ipc::token_user_sid(token).is_some_and(|sid| Some(sid) == crate::ipc::process_user_sid(None));
+    let _ = unsafe { CloseHandle(token) };
+    same
+}
+
+/// The Windows credential prompt for this account (`CredUIPromptForWindowsCredentialsW`); `false` when cancelled
+/// or the password is wrong.
+fn credential_prompt(reason: &str) -> anyhow::Result<bool> {
+    use windows::Win32::{
+        Foundation::ERROR_CANCELLED,
+        Security::Credentials::{
+            CredUIPromptForWindowsCredentialsW, CredUnPackAuthenticationBufferW, CREDUIWIN_ENUMERATE_CURRENT_USER, CREDUIWIN_GENERIC,
+            CREDUI_INFOW, CRED_PACK_PROTECTED_CREDENTIALS,
+        },
+        System::Com::CoTaskMemFree,
+    };
+    let wide = |s: &str| s.encode_utf16().chain(std::iter::once(0)).collect::<Vec<u16>>();
+    let (caption, message) = (wide("rcli"), wide(reason));
+    let info = CREDUI_INFOW {
+        cbSize: size_of::<CREDUI_INFOW>() as u32,
+        pszCaptionText: windows::core::PCWSTR(caption.as_ptr()),
+        pszMessageText: windows::core::PCWSTR(message.as_ptr()),
+        ..Default::default()
+    };
+    let (mut package, mut out, mut out_len) = (0u32, std::ptr::null_mut(), 0u32);
+    let flags = CREDUIWIN_GENERIC | CREDUIWIN_ENUMERATE_CURRENT_USER;
+    let asked = unsafe { CredUIPromptForWindowsCredentialsW(Some(&info), 0, &mut package, None, 0, &mut out, &mut out_len, None, flags) };
+    if asked == ERROR_CANCELLED.0 {
+        return Ok(false);
+    }
+    anyhow::ensure!(asked == 0, "the Windows credential prompt failed (error {asked})");
+    let (mut user, mut domain, mut password) = ([0u16; 514], [0u16; 338], [0u16; 514]);
+    let (mut user_len, mut domain_len, mut password_len) = (user.len() as u32, domain.len() as u32, password.len() as u32);
+    let unpacked = unsafe {
+        CredUnPackAuthenticationBufferW(
+            CRED_PACK_PROTECTED_CREDENTIALS,
+            out,
+            out_len,
+            Some(windows::core::PWSTR(user.as_mut_ptr())),
+            &mut user_len,
+            Some(windows::core::PWSTR(domain.as_mut_ptr())),
+            Some(&mut domain_len),
+            Some(windows::core::PWSTR(password.as_mut_ptr())),
+            &mut password_len,
+        )
+    };
+    unsafe {
+        std::ptr::write_bytes(out as *mut u8, 0, out_len as usize);
+        CoTaskMemFree(Some(out));
+    }
+    let text = |w: &[u16]| String::from_utf16_lossy(&w[..w.iter().position(|c| *c == 0).unwrap_or(w.len())]);
+    // The prompt often returns `DOMAIN\user` with no separate domain.
+    let (user, domain) = match (text(&user), text(&domain)) {
+        (user, domain) if domain.is_empty() => match user.split_once('\\') {
+            Some((domain, user)) => (user.to_owned(), domain.to_owned()),
+            None => (user, domain),
+        },
+        both => both,
+    };
+    let checked = unpacked.is_ok() && logs_on_as_me(&user, &domain, &text(&password));
+    password.fill(0);
+    Ok(checked)
+}
+
+struct ConPty {
+    master: Arc<Mutex<Option<Box<dyn MasterPty + Send>>>>,
+    exit: Arc<(Mutex<Option<i32>>, Condvar)>,
+    pid: Option<u32>,
+}
+
+impl PtyControl for ConPty {
+    fn resize(&mut self, cols: u16, rows: u16) -> anyhow::Result<()> {
+        match self.master.lock().unwrap().as_ref() {
+            Some(m) => m.resize(size(cols, rows)),
+            None => Ok(()),
+        }
+    }
+
+    fn wait(&mut self) -> anyhow::Result<i32> {
+        let (lock, cvar) = &*self.exit;
+        Ok(cvar.wait_while(lock.lock().unwrap(), |code| code.is_none()).unwrap().unwrap())
+    }
+
+    fn kill(&mut self) -> anyhow::Result<()> {
+        if let Some(pid) = self.pid {
+            kill_tree(pid);
+        }
+        Ok(())
+    }
+}
+
+/// Moves the pointer to virtual-screen pixel (x, y). enigo's absolute move only spans the primary display.
+fn move_pointer(x: i32, y: i32) -> anyhow::Result<()> {
+    unsafe {
+        let (vx, vy) = (GetSystemMetrics(SM_XVIRTUALSCREEN), GetSystemMetrics(SM_YVIRTUALSCREEN));
+        let (vw, vh) = (GetSystemMetrics(SM_CXVIRTUALSCREEN), GetSystemMetrics(SM_CYVIRTUALSCREEN));
+        let mi = MOUSEINPUT {
+            dx: normalize(x - vx, vw),
+            dy: normalize(y - vy, vh),
+            dwFlags: MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
+            ..Default::default()
+        };
+        let input = INPUT { r#type: INPUT_MOUSE, Anonymous: INPUT_0 { mi } };
+        anyhow::ensure!(SendInput(&[input], size_of::<INPUT>() as i32) == 1, "SendInput refused the pointer move");
+    }
+    Ok(())
+}
+
+/// Pixel `p` of a `size`-pixel span as SendInput's 0..65535 absolute coordinate. Windows maps n back to
+/// (n * size) >> 16, so the smallest n with n * size >= p * 65536 lands exactly on `p`.
+fn normalize(p: i32, size: i32) -> i32 {
+    ((p as i64 * 65536 + size as i64 - 1) / size.max(1) as i64) as i32
+}
+
+/// Wake-on-LAN: six 0xFF bytes, then the MAC sixteen times.
+fn magic_packet(mac: [u8; 6]) -> Vec<u8> {
+    [vec![0xFF; 6], mac.repeat(16)].concat()
+}
+
+fn size(cols: u16, rows: u16) -> PtySize {
+    PtySize { rows, cols, pixel_width: 0, pixel_height: 0 }
+}
+
+/// A script for `powershell -EncodedCommand` (base64 of UTF-16LE), so quotes in it survive the command line.
+fn encode(script: &str) -> String {
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD.encode(script.encode_utf16().flat_map(u16::to_le_bytes).collect::<Vec<u8>>())
+}
+
+/// Ends `pid` and everything it started.
+fn kill_tree(pid: u32) {
+    let _ = Command::new("taskkill.exe").args(["/T", "/F", "/PID", &pid.to_string()]).creation_flags(CREATE_NO_WINDOW).output();
+}
+
+/// COM on this thread (UI Automation, WinRT OCR); calls come from arbitrary blocking threads.
+fn com_init() {
+    unsafe {
+        let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+    }
+}
+
+thread_local! {
+    /// The desktop this thread was last put on, kept open: a thread whose desktop handle is closed points at a
+    /// desktop nobody can use, so the handle lives as long as the helper thread does.
+    static CURRENT_DESKTOP: RefCell<Option<(HDESK, String)>> = const { RefCell::new(None) };
+}
+
+/// Puts the calling thread on the input desktop. The desktop changes on lock (`Winlogon`), login and a UAC prompt
+/// (`Secure Desktop`); capture, input and UI Automation only see the desktop the thread is on (ADR 0001, ticket 22).
+fn switch_to_input_desktop() -> anyhow::Result<()> {
+    unsafe {
+        let access = DESKTOP_ACCESS_FLAGS(DESKTOP_READOBJECTS.0 | DESKTOP_WRITEOBJECTS.0 | DESKTOP_ENUMERATE.0 | DESKTOP_SWITCHDESKTOP.0);
+        let desktop = match OpenInputDesktop(DF_ALLOWOTHERACCOUNTHOOK, false, access) {
+            Ok(desktop) => desktop,
+            // Only SYSTEM may open the Winlogon desktop: the lock and sign-in screens and UAC prompts.
+            Err(_) if !running_as_system() => {
+                anyhow::bail!("the lock screen, sign-in screen or a UAC prompt is showing: reaching it {}", crate::platform::SERVICE_MODE_NEEDED)
+            }
+            Err(e) => return Err(e.into()),
+        };
+        let mut name = [0u16; 128];
+        let mut needed = 0u32;
+        if let Err(e) = GetUserObjectInformationW(
+            HANDLE(desktop.0),
+            UOI_NAME,
+            Some(name.as_mut_ptr() as *mut core::ffi::c_void),
+            (name.len() * 2) as u32,
+            Some(&mut needed),
+        ) {
+            let _ = CloseDesktop(desktop);
+            return Err(e.into());
+        }
+        let name = String::from_utf16_lossy(&name[..name.iter().position(|&c| c == 0).unwrap_or(name.len())]);
+        let same = CURRENT_DESKTOP.with(|slot| slot.borrow().as_ref().is_some_and(|(_, current)| *current == name));
+        if same {
+            let _ = CloseDesktop(desktop);
+            return Ok(());
+        }
+        SetThreadDesktop(desktop)?;
+        let previous = CURRENT_DESKTOP.with(|slot| slot.borrow_mut().replace((desktop, name)));
+        if let Some((old, _)) = previous {
+            let _ = CloseDesktop(old);
+        }
+    }
+    Ok(())
+}
+
+/// Service Mode: the SYSTEM service and its session helper. Anything else is a User Mode Agent.
+fn running_as_system() -> bool {
+    crate::ipc::process_user_sid(None).as_deref() == Some("S-1-5-18")
+}
+
+/// Whether `exe` is the installed service binary (`%ProgramFiles%\rcli\rcli.exe`), which restarts through the SCM
+/// rather than as a child of itself.
+pub fn installed_service(exe: &std::path::Path) -> bool {
+    let name = |p: &std::path::Path| p.file_name().map(|n| n.to_string_lossy().to_ascii_lowercase()).unwrap_or_default();
+    name(exe) == "rcli.exe" && exe.parent().is_some_and(|dir| name(dir) == "rcli")
+}
+
+/// The user logged in on the console, if any: the Terminal User an install records.
+pub fn active_user() -> Option<String> {
+    console_session().ok().and_then(|(user, _)| (!user.is_empty()).then_some(user))
+}
+
+/// The console session's user ("" = nobody logged in) and whether it is locked.
+fn console_session() -> anyhow::Result<(String, bool)> {
+    unsafe {
+        let mut info = windows::core::PWSTR::null();
+        let mut len = 0;
+        WTSQuerySessionInformationW(
+            Some(WTS_CURRENT_SERVER_HANDLE),
+            WTSGetActiveConsoleSessionId(),
+            WTSSessionInfoEx,
+            &mut info,
+            &mut len,
+        )?;
+        let ex = &*(info.0 as *const WTSINFOEXW);
+        let level1 = &ex.Data.WTSInfoExLevel1;
+        let user = String::from_utf16_lossy(&level1.UserName).trim_end_matches('\0').to_owned();
+        // WTS_SESSIONSTATE_LOCK = 0.
+        let locked = level1.SessionFlags == 0;
+        WTSFreeMemory(info.0 as _);
+        Ok((user, locked))
+    }
+}
+
+fn window_rect(window: HWND) -> RECT {
+    let mut r = RECT::default();
+    unsafe {
+        let _ = GetWindowRect(window, &mut r);
+    }
+    r
+}
+
+fn overlaps(r: RECT, d: &DisplayInfo) -> bool {
+    r.left < d.x + d.width as i32 && r.right > d.x && r.top < d.y + d.height as i32 && r.bottom > d.y
+}
+
+/// Part of the screen rect `r` on display `d`, in that display's real pixels; `None` if none of it is.
+fn clip(r: RECT, d: &DisplayInfo) -> Option<(u32, u32, u32, u32)> {
+    let (right, bottom) = (d.x + d.width as i32, d.y + d.height as i32);
+    let (x1, y1, x2, y2) = (r.left.max(d.x), r.top.max(d.y), r.right.min(right), r.bottom.min(bottom));
+    (x2 > x1 && y2 > y1).then(|| ((x1 - d.x) as u32, (y1 - d.y) as u32, (x2 - x1) as u32, (y2 - y1) as u32))
+}
+
+/// Targetable UI Automation control types; everything else (panes, groups, images...) makes no Mark.
+#[allow(non_upper_case_globals)]
+fn role(control_type: UIA_CONTROLTYPE_ID) -> Option<&'static str> {
+    Some(match control_type {
+        UIA_ButtonControlTypeId | UIA_SplitButtonControlTypeId => "button",
+        UIA_EditControlTypeId | UIA_DocumentControlTypeId | UIA_SpinnerControlTypeId => "field",
+        UIA_SliderControlTypeId => "slider",
+        UIA_HyperlinkControlTypeId => "link",
+        UIA_TextControlTypeId => "text",
+        UIA_CheckBoxControlTypeId => "checkbox",
+        UIA_RadioButtonControlTypeId => "radio",
+        UIA_ComboBoxControlTypeId => "combobox",
+        UIA_ListItemControlTypeId | UIA_TreeItemControlTypeId => "item",
+        UIA_MenuItemControlTypeId => "menuitem",
+        UIA_TabItemControlTypeId => "tab",
+        UIA_WindowControlTypeId => "window",
+        UIA_MenuControlTypeId | UIA_MenuBarControlTypeId => "menu",
+        UIA_ListControlTypeId | UIA_TreeControlTypeId => "list",
+        _ => return None,
+    })
+}
+
+/// Nodes read per Observation, across all windows in scope, as on the other OSes.
+const UIA_MAX_NODES: usize = 3000;
+
+/// Properties fetched in the one cached request per window.
+const CACHED: [UIA_PROPERTY_ID; 16] = [
+    UIA_ControlTypePropertyId,
+    UIA_NamePropertyId,
+    UIA_BoundingRectanglePropertyId,
+    UIA_IsEnabledPropertyId,
+    UIA_HasKeyboardFocusPropertyId,
+    UIA_IsPasswordPropertyId,
+    UIA_ValueValuePropertyId,
+    UIA_ToggleToggleStatePropertyId,
+    UIA_ExpandCollapseExpandCollapseStatePropertyId,
+    UIA_SelectionItemIsSelectedPropertyId,
+    UIA_IsRangeValuePatternAvailablePropertyId,
+    UIA_RangeValueValuePropertyId,
+    UIA_LegacyIAccessibleStatePropertyId,
+    UIA_LegacyIAccessibleValuePropertyId,
+    UIA_LegacyIAccessibleRolePropertyId,
+    UIA_WindowIsModalPropertyId,
+];
+
+/// The windows Marks are read from: `foreground` plus the visible popups, menus and dialogs of its process on `d`,
+/// modal dialogs first. The taskbar and desktop are never read.
+fn scope(foreground: HWND, d: &DisplayInfo) -> Vec<HWND> {
+    unsafe extern "system" fn collect(w: HWND, list: LPARAM) -> BOOL {
+        (*(list.0 as *mut Vec<HWND>)).push(w);
+        true.into()
+    }
+    let mut all = vec![];
+    unsafe {
+        let _ = EnumWindows(Some(collect), LPARAM(&mut all as *mut Vec<HWND> as isize));
+        let pid = |w| {
+            let mut pid = 0;
+            GetWindowThreadProcessId(w, Some(&mut pid));
+            pid
+        };
+        let owner = |w| GetWindow(w, GW_OWNER).unwrap_or_default();
+        // A modal dialog disables the window that owns it.
+        let modal = |w| {
+            let o = owner(w);
+            !o.is_invalid() && !IsWindowEnabled(o).as_bool()
+        };
+        let shell = |w| {
+            let mut class = [0u16; 32];
+            let n = GetClassNameW(w, &mut class).max(0) as usize;
+            ["Shell_TrayWnd", "Shell_SecondaryTrayWnd", "Progman", "WorkerW"].contains(&String::from_utf16_lossy(&class[..n]).as_str())
+        };
+        let mut windows = vec![(foreground, modal(foreground))];
+        for w in all {
+            let popup = GetWindowLongW(w, GWL_STYLE) as u32 & WS_POPUP.0 != 0 || !owner(w).is_invalid();
+            if w != foreground
+                && popup
+                && pid(w) == pid(foreground)
+                && IsWindowVisible(w).as_bool()
+                && overlaps(window_rect(w), d)
+                && !shell(w)
+            {
+                windows.push((w, modal(w)));
+            }
+        }
+        modal_first(windows)
+    }
+}
+
+/// Items flagged modal first; otherwise the order is kept.
+fn modal_first<T>(mut windows: Vec<(T, bool)>) -> Vec<T> {
+    windows.sort_by_key(|(_, modal)| !modal);
+    windows.into_iter().map(|(w, _)| w).collect()
+}
+
+/// Appends a cached UIA subtree to `out` in pre-order, each element linked to the nearest container above it,
+/// until `budget` nodes have been visited.
+fn walk(
+    root: IUIAutomationElement,
+    d: &DisplayInfo,
+    out: &mut Vec<(UiElement, IUIAutomationElement)>,
+    budget: &mut usize,
+) -> windows::core::Result<()> {
+    let mut stack = vec![(root, None)];
+    while let Some((e, container)) = stack.pop() {
+        if *budget == 0 {
+            break;
+        }
+        *budget -= 1;
+        let mut inner = container;
+        if let Some(element) = element(&e, d, container)? {
+            if element.is_container() {
+                inner = Some(out.len());
+            }
+            out.push((element, e.clone()));
+        }
+        // A leaf has no cached children array.
+        if let Ok(children) = unsafe { e.GetCachedChildren() } {
+            for i in (0..unsafe { children.Length()? }).rev() {
+                stack.push((unsafe { children.GetElement(i)? }, inner));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Performs `action` on `e` (`found` in the tree) through its UIA patterns: a click invokes, toggles, selects or
+/// expands, else focuses a field; a double click invokes an item; a right click shows the context menu.
+/// `Ok(false)` when `e` has no pattern for it.
+fn uia_perform(found: &UiElement, e: &IUIAutomationElement, action: &UiAction) -> anyhow::Result<bool> {
+    // A press that opens a modal dialog can time out though it was done: a synthetic click on top would click twice.
+    let done = |r: windows::core::Result<()>| r.map_or_else(|err| err.code().0 as u32 == UIA_E_TIMEOUT, |()| true);
+    unsafe {
+        let invoke = || e.GetCurrentPatternAs::<IUIAutomationInvokePattern>(UIA_InvokePatternId).map(|p| done(p.Invoke()));
+        Ok(match action {
+            UiAction::SetValue(value) => {
+                let Ok(p) = e.GetCurrentPatternAs::<IUIAutomationValuePattern>(UIA_ValuePatternId) else {
+                    return Ok(false);
+                };
+                let set = p.SetValue(&windows::core::BSTR::from(value.as_str()));
+                set.map_err(|err| anyhow::anyhow!("cannot set the value of {:?} ({err})", found.text))?;
+                true
+            }
+            UiAction::Press => {
+                if let Ok(done) = invoke() {
+                    return Ok(done);
+                }
+                if let Ok(p) = e.GetCurrentPatternAs::<IUIAutomationTogglePattern>(UIA_TogglePatternId) {
+                    return Ok(done(p.Toggle()));
+                }
+                if let Ok(p) = e.GetCurrentPatternAs::<IUIAutomationSelectionItemPattern>(UIA_SelectionItemPatternId) {
+                    return Ok(done(p.Select()));
+                }
+                if let Ok(p) = e.GetCurrentPatternAs::<IUIAutomationExpandCollapsePattern>(UIA_ExpandCollapsePatternId) {
+                    let expanded = p.CurrentExpandCollapseState().is_ok_and(|s| s == ExpandCollapseState_Expanded);
+                    return Ok(done(if expanded { p.Collapse() } else { p.Expand() }));
+                }
+                found.role == "field" && e.SetFocus().is_ok()
+            }
+            UiAction::Open => found.role == "item" && invoke().unwrap_or(false),
+            UiAction::ShowMenu => e.cast::<IUIAutomationElement3>().is_ok_and(|e| e.ShowContextMenu().is_ok()),
+        })
+    }
+}
+
+/// The Mark-worthy element `e` is, from its cached properties; `None` if it makes no Mark.
+fn element(e: &IUIAutomationElement, d: &DisplayInfo, parent: Option<usize>) -> windows::core::Result<Option<UiElement>> {
+    unsafe {
+        let Some(mut role) = role(e.CachedControlType()?) else {
+            return Ok(None);
+        };
+        let text = e.CachedName()?.to_string();
+        if role == "text" && text.trim().is_empty() {
+            return Ok(None);
+        }
+        let Some((x, y, width, height)) = clip(e.CachedBoundingRectangle()?, d) else {
+            return Ok(None);
+        };
+        let get = |p| e.GetCachedPropertyValue(p).unwrap_or_default();
+        let legacy = u32::try_from(&get(UIA_LegacyIAccessibleStatePropertyId)).unwrap_or(0);
+        let dialog_role = u32::try_from(&get(UIA_LegacyIAccessibleRolePropertyId)).is_ok_and(|r| r == ROLE_SYSTEM_DIALOG);
+        if role == "window" && (bool::try_from(&get(UIA_WindowIsModalPropertyId)).unwrap_or(false) || dialog_role) {
+            role = "dialog";
+        }
+        let password = e.CachedIsPassword()?.as_bool() || legacy & STATE_SYSTEM_PROTECTED != 0;
+        let value = if password {
+            None
+        } else {
+            let value = get(UIA_ValueValuePropertyId).to_string();
+            if !value.is_empty() {
+                Some(value)
+            } else if bool::try_from(&get(UIA_IsRangeValuePatternAvailablePropertyId)).unwrap_or(false) {
+                f64::try_from(&get(UIA_RangeValueValuePropertyId)).ok().map(|v| v.to_string())
+            } else {
+                Some(get(UIA_LegacyIAccessibleValuePropertyId).to_string()).filter(|v| !v.is_empty())
+            }
+        };
+        let states = states(
+            e.CachedIsEnabled()?.as_bool(),
+            e.CachedHasKeyboardFocus()?.as_bool(),
+            ToggleState(i32::try_from(&get(UIA_ToggleToggleStatePropertyId)).unwrap_or(ToggleState_Indeterminate.0)),
+            ExpandCollapseState(
+                i32::try_from(&get(UIA_ExpandCollapseExpandCollapseStatePropertyId)).unwrap_or(ExpandCollapseState_LeafNode.0),
+            ),
+            bool::try_from(&get(UIA_SelectionItemIsSelectedPropertyId)).unwrap_or(false),
+            legacy,
+        );
+        Ok(Some(UiElement { role: role.into(), text, x, y, width, height, states, value, password, parent }))
+    }
+}
+
+/// Mark States that differ from the default, from UIA properties or the LegacyIAccessible `legacy` state bits.
+fn states(enabled: bool, focused: bool, toggle: ToggleState, expand: ExpandCollapseState, selected: bool, legacy: u32) -> Vec<String> {
+    const STATE_SYSTEM_UNAVAILABLE: u32 = 0x1;
+    let has = |bit| legacy & bit != 0;
+    [
+        ("disabled", !enabled || has(STATE_SYSTEM_UNAVAILABLE)),
+        ("focused", focused || has(STATE_SYSTEM_FOCUSED)),
+        ("checked", toggle == ToggleState_On || has(STATE_SYSTEM_CHECKED)),
+        ("selected", selected || has(STATE_SYSTEM_SELECTED)),
+        ("expanded", expand == ExpandCollapseState_Expanded || has(STATE_SYSTEM_EXPANDED)),
+        ("collapsed", expand == ExpandCollapseState_Collapsed || has(STATE_SYSTEM_COLLAPSED)),
+    ]
+    .into_iter()
+    .filter(|&(_, on)| on)
+    .map(|(name, _)| name.to_string())
+    .collect()
+}
+
+/// Key names the Executor sends (`"a"`, `"enter"`, `"ctrl"` from `ctrl+shift+t`) as enigo keys.
+fn key(name: &str) -> anyhow::Result<enigo::Key> {
+    use enigo::Key::*;
+    let lower = name.to_lowercase();
+    Ok(match lower.as_str() {
+        "enter" | "return" => Return,
+        "tab" => Tab,
+        "esc" | "escape" => Escape,
+        "backspace" => Backspace,
+        "delete" | "del" => Delete,
+        "insert" => Insert,
+        "space" => Space,
+        "home" => Home,
+        "end" => End,
+        "pageup" => PageUp,
+        "pagedown" => PageDown,
+        "up" => UpArrow,
+        "down" => DownArrow,
+        "left" => LeftArrow,
+        "right" => RightArrow,
+        "ctrl" | "control" => Control,
+        "shift" => Shift,
+        "alt" | "option" => Alt,
+        "win" | "meta" | "cmd" | "super" => Meta,
+        "capslock" => CapsLock,
+        f if f.len() > 1 && f.starts_with('f') && f[1..].parse::<u8>().is_ok_and(|n| (1..=12).contains(&n)) => {
+            [F1, F2, F3, F4, F5, F6, F7, F8, F9, F10, F11, F12][f[1..].parse::<usize>().unwrap() - 1]
+        }
+        _ if name.chars().count() == 1 => Unicode(name.chars().next().unwrap()),
+        _ => anyhow::bail!("unknown key {name:?}"),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn executor_key_names_map_to_keys() {
+        assert_eq!(key("Enter").unwrap(), enigo::Key::Return);
+        assert_eq!(key("ctrl").unwrap(), enigo::Key::Control);
+        assert_eq!(key("f5").unwrap(), enigo::Key::F5);
+        assert_eq!(key("a").unwrap(), enigo::Key::Unicode('a'));
+        assert!(key("nosuchkey").is_err());
+    }
+
+    #[test]
+    fn every_pixel_survives_absolute_pointer_coordinates() {
+        for size in [1024, 1920, 3840, 1920 + 2560 + 3840] {
+            for p in 0..size {
+                assert_eq!((normalize(p, size) as i64 * size as i64) >> 16, p as i64, "pixel {p} of {size}");
+            }
+        }
+    }
+
+    #[test]
+    fn scripts_are_encoded_as_utf16le_base64() {
+        // powershell -EncodedCommand "ZQBjAGgAbwAgACIAaQAiAA==" runs: echo "i"
+        assert_eq!(encode("echo \"i\""), "ZQBjAGgAbwAgACIAaQAiAA==");
+    }
+
+    #[test]
+    fn magic_packet_is_ff_then_mac_sixteen_times() {
+        let p = magic_packet([1, 2, 3, 4, 5, 6]);
+        assert_eq!(p.len(), 102);
+        assert_eq!(&p[..6], &[0xFF; 6]);
+        assert_eq!(&p[96..], &[1, 2, 3, 4, 5, 6]);
+    }
+
+    #[test]
+    fn element_boxes_are_clipped_to_their_display() {
+        let d = DisplayInfo { index: 1, x: 1920, y: 0, width: 1280, height: 1024, scale: 1.0, primary: false };
+        assert_eq!(clip(RECT { left: 1900, top: 10, right: 2000, bottom: 30 }, &d), Some((0, 10, 80, 20)));
+        assert_eq!(clip(RECT { left: 0, top: 0, right: 100, bottom: 100 }, &d), None);
+    }
+
+    #[test]
+    fn uia_values_and_legacy_state_bits_become_mark_states() {
+        assert_eq!(states(false, false, ToggleState_On, ExpandCollapseState_LeafNode, false, 0), ["disabled", "checked"]);
+        assert!(states(true, false, ToggleState_Off, ExpandCollapseState_LeafNode, false, 0).is_empty());
+        let legacy = STATE_SYSTEM_FOCUSED | STATE_SYSTEM_SELECTED | STATE_SYSTEM_EXPANDED;
+        assert_eq!(
+            states(true, false, ToggleState_Indeterminate, ExpandCollapseState_LeafNode, false, legacy),
+            ["focused", "selected", "expanded"]
+        );
+    }
+
+    #[test]
+    fn sliders_and_spinners_make_marks_that_carry_a_value() {
+        assert_eq!((role(UIA_SliderControlTypeId), role(UIA_SpinnerControlTypeId)), (Some("slider"), Some("field")));
+    }
+
+    #[test]
+    fn modal_dialogs_come_first_then_the_rest_in_order() {
+        assert_eq!(modal_first(vec![("foreground", false), ("menu", false), ("dialog", true)]), ["dialog", "foreground", "menu"]);
+    }
+}

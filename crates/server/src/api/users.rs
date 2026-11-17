@@ -1,0 +1,70 @@
+use axum::{
+    extract::{rejection::JsonRejection, Path, State},
+    http::StatusCode,
+    routing::{get, post},
+    Json, Router,
+};
+use serde::Deserialize;
+use serde_json::{json, Value};
+
+use super::{bad_request, ApiError, SignedIn};
+use crate::auth::{self, User};
+
+pub fn routes() -> Router<super::State> {
+    Router::new()
+        .route("/api/v1/users", get(list).post(create))
+        .route("/api/v1/users/{name}/disable", post(disable))
+        .route("/api/v1/users/{name}/credentials", post(set_credentials))
+}
+
+impl From<auth::Error> for ApiError {
+    fn from(e: auth::Error) -> Self {
+        match e {
+            auth::Error::BadRequest(m) => bad_request(m),
+            auth::Error::NameTaken => ApiError::new(StatusCode::CONFLICT, "name_taken", "a user with this name exists"),
+            auth::Error::NotFound => ApiError::new(StatusCode::NOT_FOUND, "not_found", "no such user or token"),
+            auth::Error::LastUser => ApiError::new(StatusCode::BAD_REQUEST, "last_user", "the last enabled User cannot be disabled"),
+            auth::Error::DisableSelf => ApiError::new(StatusCode::BAD_REQUEST, "disable_self", "you cannot disable yourself"),
+            auth::Error::Internal(e) => e.into(),
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct NewUser {
+    name: String,
+}
+
+async fn create(
+    _: SignedIn,
+    State(state): State<super::State>,
+    body: Result<Json<NewUser>, JsonRejection>,
+) -> Result<(StatusCode, Json<User>), ApiError> {
+    let Json(u) = body.map_err(|e| bad_request(e.body_text()))?;
+    Ok((StatusCode::CREATED, Json(auth::create_user(&state, &u.name).await?)))
+}
+
+async fn list(_: SignedIn, State(state): State<super::State>) -> Result<Json<Vec<User>>, ApiError> {
+    Ok(Json(auth::list_users(&state).await?))
+}
+
+async fn disable(SignedIn(by): SignedIn, State(state): State<super::State>, Path(name): Path<String>) -> Result<Json<User>, ApiError> {
+    Ok(Json(auth::disable_user(&state, &by, &name).await?))
+}
+
+#[derive(Deserialize)]
+struct Credentials {
+    password: String,
+}
+
+/// Sets the user's Dashboard password; TOTP is each User's own switch (`/api/v1/me/totp`).
+async fn set_credentials(
+    _: SignedIn,
+    State(state): State<super::State>,
+    Path(name): Path<String>,
+    body: Result<Json<Credentials>, JsonRejection>,
+) -> Result<Json<Value>, ApiError> {
+    let Json(c) = body.map_err(|e| bad_request(e.body_text()))?;
+    auth::set_credentials(&state, &name, &c.password).await?;
+    Ok(Json(json!({ "user": name })))
+}

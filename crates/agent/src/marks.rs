@@ -1,0 +1,186 @@
+//! Mark Detector: finds Marks (accessibility tree, OCR when there is none), draws them on Observation images
+//! and resolves a text target to one Mark.
+
+use image::{Rgba, RgbaImage};
+use rcli_protocol::agent::{Error, Mark};
+
+use crate::{
+    coords,
+    platform::{Frame, Platform, UiElement},
+};
+
+/// Marks on `frame` of `display`, in image space, numbered from `first`; true when they come from the
+/// accessibility tree (false: OCR).
+pub fn detect(p: &dyn Platform, display: u32, frame: &Frame, first: u32) -> anyhow::Result<(Vec<Mark>, bool)> {
+    let (elements, from_tree) = match p.accessibility(display)? {
+        Some(tree) => (tree, true),
+        None => (p.recognize_text(frame)?, false),
+    };
+    // Element index -> Mark number; elements without a box make no Mark.
+    let mut numbers = vec![None; elements.len()];
+    let mut next = first;
+    for (i, e) in elements.iter().enumerate() {
+        if e.width > 0 && e.height > 0 {
+            numbers[i] = Some(next);
+            next += 1;
+        }
+    }
+    // The nearest container above that made a Mark (bounded, in case an adapter reports a cycle).
+    let parent = |mut i: usize| {
+        for _ in 0..elements.len() {
+            i = elements.get(i)?.parent?;
+            if let Some(n) = numbers.get(i).copied().flatten() {
+                return Some(n);
+            }
+        }
+        None
+    };
+    let parents: Vec<Option<u32>> = (0..elements.len()).map(parent).collect();
+    let marks = elements
+        .into_iter()
+        .zip(numbers.into_iter().zip(parents))
+        .filter_map(|(e, (number, parent))| Some(to_mark(frame, display, number?, parent, e)))
+        .collect();
+    Ok((marks, from_tree))
+}
+
+fn to_mark(frame: &Frame, display: u32, number: u32, parent: Option<u32>, e: UiElement) -> Mark {
+    let (x, y) = coords::to_image(frame.width, frame.height, e.x, e.y);
+    let (x2, y2) = coords::to_image(frame.width, frame.height, e.x + e.width, e.y + e.height);
+    let value = if e.password { String::new() } else { e.value.unwrap_or_default() };
+    Mark {
+        number,
+        text: e.text,
+        role: e.role,
+        display,
+        x,
+        y,
+        width: (x2 - x).max(1),
+        height: (y2 - y).max(1),
+        states: e.states,
+        value,
+        parent,
+    }
+}
+
+/// The Marks whose text is `text` (case-insensitive); if none is equal, those that contain it.
+fn matching<'a>(marks: &'a [Mark], text: &str) -> Vec<&'a Mark> {
+    let want = text.trim().to_lowercase();
+    let equal: Vec<&Mark> = marks.iter().filter(|m| m.text.trim().to_lowercase() == want).collect();
+    if equal.is_empty() { marks.iter().filter(|m| m.text.to_lowercase().contains(&want)).collect() } else { equal }
+}
+
+/// The Marks with `role`; all of them when it is `None`.
+pub fn with_role(marks: &[Mark], role: Option<&str>) -> Vec<Mark> {
+    marks.iter().filter(|m| role.is_none_or(|r| m.role == r)).cloned().collect()
+}
+
+/// The one Mark whose text is `text` (case-insensitive); if none is equal, the one that contains it.
+pub fn by_text<'a>(marks: &'a [Mark], text: &str) -> Result<&'a Mark, Error> {
+    let err = |code: &str, message: String| Error { code: code.into(), message };
+    let found = matching(marks, text);
+    match found[..] {
+        [m] => Ok(m),
+        [] => Err(err("text_not_found", format!("no Mark with text {text:?} on screen"))),
+        _ => Err(err(
+            "ambiguous_text",
+            format!(
+                "text {text:?} is ambiguous: {}; target one by Mark number",
+                found.iter().map(|m| format!("Mark {} {} {:?}", m.number, m.role, m.text)).collect::<Vec<_>>().join(", ")
+            ),
+        )),
+    }
+}
+
+/// Whether some Mark (with `role`, if given) would match `text` as a text target: equal to it or containing it.
+pub fn present(marks: &[Mark], text: &str, role: Option<&str>) -> bool {
+    !matching(&with_role(marks, role), text).is_empty()
+}
+
+/// Centre of a Mark, in image space.
+pub fn center(m: &Mark) -> (u32, u32) {
+    (m.x + m.width / 2, m.y + m.height / 2)
+}
+
+const BOX: Rgba<u8> = Rgba([255, 0, 160, 255]);
+const LABEL_TEXT: Rgba<u8> = Rgba([255, 255, 255, 255]);
+/// 3x5 digit glyphs, one row per 3 bits.
+const DIGITS: [[u8; 5]; 10] = [
+    [7, 5, 5, 5, 7],
+    [2, 6, 2, 2, 7],
+    [7, 1, 7, 4, 7],
+    [7, 1, 7, 1, 7],
+    [5, 5, 7, 1, 1],
+    [7, 4, 7, 1, 7],
+    [7, 4, 7, 5, 7],
+    [7, 1, 1, 1, 1],
+    [7, 5, 7, 5, 7],
+    [7, 5, 7, 1, 7],
+];
+const PX: u32 = 2;
+
+/// Outlines each Mark and writes its number in a label at its top-left corner.
+pub fn annotate(img: &mut RgbaImage, marks: &[Mark]) {
+    let (w, h) = img.dimensions();
+    let mut put = |x: u32, y: u32, c| {
+        if x < w && y < h {
+            img.put_pixel(x, y, c)
+        }
+    };
+    for m in marks {
+        for i in 0..=m.width {
+            put(m.x + i, m.y, BOX);
+            put(m.x + i, m.y + m.height, BOX);
+        }
+        for i in 0..=m.height {
+            put(m.x, m.y + i, BOX);
+            put(m.x + m.width, m.y + i, BOX);
+        }
+        let digits = m.number.to_string();
+        let (lw, lh) = (digits.len() as u32 * 4 * PX + PX, 7 * PX);
+        for x in 0..lw {
+            for y in 0..lh {
+                put(m.x + x, m.y + y, BOX);
+            }
+        }
+        for (i, d) in digits.bytes().enumerate() {
+            for (row, bits) in DIGITS[(d - b'0') as usize].iter().enumerate() {
+                for col in 0..3 {
+                    if bits & (4 >> col) != 0 {
+                        let (gx, gy) = (m.x + PX + (i as u32 * 4 + col) * PX, m.y + PX + row as u32 * PX);
+                        (0..PX * PX).for_each(|k| put(gx + k % PX, gy + k / PX, LABEL_TEXT));
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mark(number: u32, text: &str) -> Mark {
+        Mark { number, text: text.into(), role: "button".into(), ..Default::default() }
+    }
+
+    #[test]
+    fn text_matches_exactly_before_it_matches_part_of_a_mark() {
+        let marks = [mark(1, "Save"), mark(2, "Save as…"), mark(3, "Cancel")];
+        assert_eq!(by_text(&marks, "save").unwrap().number, 1);
+        assert_eq!(by_text(&marks, "as…").unwrap().number, 2);
+        assert!(by_text(&marks, "Sav").unwrap_err().message.contains("Mark 1 button \"Save\", Mark 2"));
+        assert!(by_text(&marks, "Delete").unwrap_err().message.contains("no Mark"));
+    }
+
+    #[test]
+    fn annotation_outlines_the_mark_and_labels_it_with_its_number() {
+        let mut img = RgbaImage::new(100, 100);
+        annotate(&mut img, &[Mark { number: 7, x: 10, y: 10, width: 40, height: 20, ..Default::default() }]);
+        assert_eq!(img.get_pixel(40, 30), &BOX, "bottom edge");
+        assert_eq!(img.get_pixel(50, 20), &BOX, "right edge");
+        assert_eq!(img.get_pixel(12, 12), &LABEL_TEXT, "top-left of the 7");
+        assert_eq!(img.get_pixel(12, 14), &BOX, "label background left of the 7's stem");
+        assert_eq!(img.get_pixel(30, 25), &Rgba([0, 0, 0, 0]), "inside stays as it was");
+    }
+}

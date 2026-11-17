@@ -1,0 +1,542 @@
+//! Auth: users and their sessions. Every User may do everything (ADR 0009).
+//! The bootstrap token from config acts as a User only until an enabled User has a live session (first run).
+//! A session is an API token with an expiry, from Dashboard sign-in or `rcli login`.
+
+use chrono::{DateTime, Utc};
+use serde::Serialize;
+use sha2::{Digest, Sha256};
+use uuid::Uuid;
+
+use crate::AppState;
+
+#[derive(Serialize, Debug, Clone, sqlx::FromRow)]
+pub struct User {
+    pub id: Uuid,
+    pub name: String,
+    pub disabled_at: Option<DateTime<Utc>>,
+    /// Set for a password connection: the only Device it may reach.
+    #[sqlx(default)]
+    #[serde(skip)]
+    pub device_scope: Option<Uuid>,
+}
+
+impl User {
+    /// How the person at the Device sees this Controller: `<host> (<IP>)` for a password connection, `<name>
+    /// (Dashboard)` for a Dashboard User. `rcli agent info` lists and `disconnect` matches this name.
+    pub fn controller_display(&self) -> String {
+        if self.device_scope.is_some() {
+            self.name.clone()
+        } else {
+            format!("{} (Dashboard)", self.name)
+        }
+    }
+}
+
+/// Wrong Device Passwords in a row that lock a (Device ID, IP) pair out for a minute.
+pub const MAX_FAILED_DEVICE_PASSWORDS: i32 = 5;
+pub const PASSWORD_LOCKOUT: chrono::Duration = chrono::Duration::minutes(1);
+/// The most a lockout grows to, however many times it repeats.
+pub const PASSWORD_LOCKOUT_MAX: chrono::Duration = chrono::Duration::hours(1);
+/// Failures of a pair not seen for this long start over.
+// shortcut: the window is fixed, not sliding; a slower scanner can try a few per window indefinitely. Move to a
+// sliding window if that shows up.
+pub const PASSWORD_FAILURE_WINDOW: chrono::Duration = chrono::Duration::hours(24);
+
+pub enum ControllerError {
+    /// Wrong Server Key, Device ID or Device Password (no hint which).
+    Unauthorized,
+    /// Too many wrong passwords for this (Device ID, IP); nothing is checked until then.
+    Locked(chrono::DateTime<chrono::Utc>),
+}
+
+/// A real check's cost for an unknown Device, so response time does not reveal whether the Device ID exists.
+fn dummy_password_check(password: &str) {
+    static DUMMY: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    let hash = DUMMY.get_or_init(|| rcli_protocol::password::hash("no such Device Password"));
+    let _ = rcli_protocol::password::verify(password, hash);
+}
+
+/// The principal a password connection authenticates as: `<controller hostname> (<IP>)`, with a stable id per
+/// (name, IP) so the Control Lock holder survives reconnects. The hostname is the client's word, so its brackets are
+/// dropped: it cannot pass for another display name such as `alice (Dashboard)`.
+fn controller_user(controller: &str, ip: &str) -> User {
+    let name = format!("{} ({ip})", controller.replace(['(', ')'], "").trim());
+    let digest = Sha256::digest(name.as_bytes());
+    let id_bytes = <[u8; 16]>::try_from(&digest[..16]).expect("16 bytes");
+    User { id: Uuid::from_bytes(id_bytes), name, disabled_at: None, device_scope: None }
+}
+
+/// A password connection: Server Key secret + Device ID + Device Password. It reaches only its own Device and has
+/// no Server administration rights. Its display name is `<controller hostname> (<IP>)`, also as Control Lock holder.
+/// Wrong Device Passwords are counted per (Device ID, IP): the fifth locks the pair out for a minute, each later
+/// lockout doubles, and a correct password after that resets the count.
+// shortcut: a wrong Server Key is not counted (it reveals nothing about a password); a leaked key still has to pass
+// the limiter on the Device Password.
+pub async fn authenticate_controller(
+    state: &AppState,
+    server_key: &str,
+    device: &str,
+    password: &str,
+    controller: &str,
+    ip: &str,
+) -> anyhow::Result<Result<User, ControllerError>> {
+    if !crate::server_key::admits(state, server_key).await {
+        return Ok(Err(ControllerError::Unauthorized));
+    }
+    // A Device that exists is keyed by its UUID, so every way of naming it (Device ID, UUID) shares one bucket; an
+    // unknown Device ID is keyed as presented, so it is counted too and cannot dodge the limiter.
+    let resolved = crate::registry::resolve(state, device).await?;
+    let bucket = resolved.map_or_else(|| device.to_owned(), |id| id.to_string());
+    let now = state.clock.now();
+    let locked_until: Option<chrono::DateTime<chrono::Utc>> =
+        sqlx::query_scalar("SELECT locked_until FROM device_password_failures WHERE device = $1 AND ip = $2")
+            .bind(&bucket)
+            .bind(ip)
+            .fetch_optional(&state.db)
+            .await?
+            .flatten();
+    if let Some(until) = locked_until.filter(|u| *u > now) {
+        return Ok(Err(ControllerError::Locked(until)));
+    }
+    let Some(id) = resolved else {
+        dummy_password_check(password);
+        return password_failed(state, &bucket, ip, now).await;
+    };
+    let stored: Option<String> =
+        sqlx::query_scalar("SELECT device_password_hash FROM devices WHERE id = $1")
+            .bind(id)
+            .fetch_optional(&state.db)
+            .await?;
+    let Some(stored) = stored.filter(|h| !h.is_empty()) else {
+        dummy_password_check(password);
+        return password_failed(state, &bucket, ip, now).await;
+    };
+    if !rcli_protocol::password::verify(password, &stored) {
+        return password_failed(state, &bucket, ip, now).await;
+    }
+    sqlx::query("DELETE FROM device_password_failures WHERE device = $1 AND ip = $2")
+        .bind(&bucket)
+        .bind(ip)
+        .execute(&state.db)
+        .await?;
+    let mut user = controller_user(controller, ip);
+    user.device_scope = Some(id);
+    Ok(Ok(user))
+}
+
+/// Counts one wrong Device Password (or unknown Device ID) for the pair; the one reaching
+/// `MAX_FAILED_DEVICE_PASSWORDS` starts a lockout, doubling each time up to `PASSWORD_LOCKOUT_MAX`.
+async fn password_failed(
+    state: &AppState,
+    bucket: &str,
+    ip: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> anyhow::Result<Result<User, ControllerError>> {
+    // One atomic upsert: counting with a read-then-write would lose failures under parallel requests, so a
+    // parallel guesser would never reach the lockout. The lockout length is 1, 2, 4 ... minutes, capped at an hour.
+    sqlx::query(
+        "INSERT INTO device_password_failures AS f (device, ip, failures, lockouts, locked_until, seen_at)
+         VALUES ($1, $2, 1, 0, NULL, $3)
+         ON CONFLICT (device, ip) DO UPDATE SET
+            failures = CASE
+                WHEN f.seen_at < $3 - $4::interval THEN 1
+                WHEN f.failures + 1 >= $5 THEN 0
+                ELSE f.failures + 1 END,
+            lockouts = CASE
+                WHEN f.seen_at < $3 - $4::interval THEN 0
+                WHEN f.failures + 1 >= $5 THEN f.lockouts + 1
+                ELSE f.lockouts END,
+            locked_until = CASE
+                WHEN f.seen_at < $3 - $4::interval THEN NULL
+                WHEN f.failures + 1 >= $5 THEN LEAST(
+                    $3 + $6::interval * power(2, LEAST(f.lockouts, 6))::int, $3 + $7::interval)
+                ELSE NULL END,
+            seen_at = $3",
+    )
+    .bind(bucket)
+    .bind(ip)
+    .bind(now)
+    .bind(PASSWORD_FAILURE_WINDOW)
+    .bind(MAX_FAILED_DEVICE_PASSWORDS)
+    .bind(PASSWORD_LOCKOUT)
+    .bind(PASSWORD_LOCKOUT_MAX)
+    .execute(&state.db)
+    .await?;
+    Ok(Err(ControllerError::Unauthorized))
+}
+
+#[derive(Debug)]
+pub enum Error {
+    BadRequest(String),
+    NameTaken,
+    NotFound,
+    /// Disabling the last enabled User.
+    LastUser,
+    /// Disabling oneself.
+    DisableSelf,
+    Internal(anyhow::Error),
+}
+
+impl<E: Into<anyhow::Error>> From<E> for Error {
+    fn from(e: E) -> Self {
+        Self::Internal(e.into())
+    }
+}
+
+fn hash(token: &str) -> Vec<u8> {
+    Sha256::digest(token.as_bytes()).to_vec()
+}
+
+const USER_COLS: &str = "id, name, disabled_at";
+
+/// The user a bearer token belongs to, if the token is live and the user enabled. Only Dashboard sessions expire;
+/// a token without an expiry is from the removed `rcli token` and is refused.
+pub async fn authenticate(state: &AppState, token: &str) -> anyhow::Result<Option<User>> {
+    let user = sqlx::query_as::<_, User>(&format!(
+        "SELECT u.{} FROM api_tokens t JOIN users u ON u.id = t.user_id
+         WHERE t.token_hash = $1 AND t.revoked_at IS NULL AND u.disabled_at IS NULL
+           AND t.expires_at > $2",
+        USER_COLS.replace(", ", ", u.")
+    ))
+    .bind(hash(token))
+    .bind(state.clock.now())
+    .fetch_optional(&state.db)
+    .await?;
+    if user.is_some() || token != state.config.bootstrap_admin_token {
+        return Ok(user);
+    }
+    let user_signed_in: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM api_tokens t JOIN users u ON u.id = t.user_id
+         WHERE u.disabled_at IS NULL AND t.revoked_at IS NULL AND t.expires_at > $1)",
+    )
+    .bind(state.clock.now())
+    .fetch_one(&state.db)
+    .await?;
+    Ok((!user_signed_in).then(|| User { id: Uuid::nil(), name: "bootstrap".into(), disabled_at: None, device_scope: None }))
+}
+
+pub async fn create_user(state: &AppState, name: &str) -> Result<User, Error> {
+    // Names go into URL paths (`/users/{name}/...`), so keep them URL-safe.
+    if name.is_empty() || name.len() > 64 || !name.chars().all(|c| c.is_ascii_alphanumeric() || "._-".contains(c)) {
+        return Err(Error::BadRequest("name must be 1-64 characters of A-Z a-z 0-9 . _ -".into()));
+    }
+    sqlx::query_as::<_, User>(&format!(
+        "INSERT INTO users (id, name, created_at) VALUES ($1, $2, $3)
+         ON CONFLICT (name) DO NOTHING RETURNING {USER_COLS}"
+    ))
+    .bind(Uuid::new_v4())
+    .bind(name)
+    .bind(state.clock.now())
+    .fetch_optional(&state.db)
+    .await?
+    .ok_or(Error::NameTaken)
+}
+
+pub async fn list_users(state: &AppState) -> anyhow::Result<Vec<User>> {
+    Ok(sqlx::query_as(&format!("SELECT {USER_COLS} FROM users ORDER BY name")).fetch_all(&state.db).await?)
+}
+
+/// Disables a user; all of their tokens stop working. `by` may not disable themselves, and the last enabled User
+/// stays enabled, so someone can always sign in.
+pub async fn disable_user(state: &AppState, by: &User, name: &str) -> Result<User, Error> {
+    if by.name == name {
+        return Err(Error::DisableSelf);
+    }
+    // shortcut: two Users disabling each other at the same instant can both succeed (READ COMMITTED); lock the
+    // users table here if that ever matters.
+    let disabled = sqlx::query_as::<_, User>(&format!(
+        "UPDATE users SET disabled_at = COALESCE(disabled_at, $2) WHERE name = $1
+           AND (disabled_at IS NOT NULL OR EXISTS (SELECT 1 FROM users o WHERE o.name <> $1 AND o.disabled_at IS NULL))
+         RETURNING {USER_COLS}"
+    ))
+    .bind(name)
+    .bind(state.clock.now())
+    .fetch_optional(&state.db)
+    .await?;
+    if let Some(user) = disabled {
+        return Ok(user);
+    }
+    let exists: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM users WHERE name = $1)").bind(name).fetch_one(&state.db).await?;
+    Err(if exists { Error::LastUser } else { Error::NotFound })
+}
+
+/// Revokes the token itself (sign-out from `rcli logout` or the Dashboard).
+pub async fn revoke_by_token(state: &AppState, token: &str) -> anyhow::Result<()> {
+    sqlx::query("UPDATE api_tokens SET revoked_at = COALESCE(revoked_at, $2) WHERE token_hash = $1")
+        .bind(hash(token))
+        .bind(state.clock.now())
+        .execute(&state.db)
+        .await?;
+    Ok(())
+}
+
+/// How long a Dashboard session lasts.
+pub const SESSION_TTL: chrono::Duration = chrono::Duration::hours(12);
+const PBKDF2_ITERATIONS: u32 = 600_000;
+const TOTP_STEP_SECS: i64 = 30;
+
+fn pbkdf2(password: &str, salt: &[u8], iterations: u32) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    let n = std::num::NonZeroU32::new(iterations).unwrap();
+    ring::pbkdf2::derive(ring::pbkdf2::PBKDF2_HMAC_SHA256, n, salt, password.as_bytes(), &mut out);
+    out
+}
+
+fn random<const N: usize>() -> [u8; N] {
+    ring::rand::generate(&ring::rand::SystemRandom::new()).expect("system RNG").expose()
+}
+
+/// Stored as `pbkdf2-sha256$<iterations>$<salt b64>$<hash b64>`.
+fn hash_password(password: &str) -> String {
+    use data_encoding::BASE64;
+    let salt = random::<16>();
+    let h = pbkdf2(password, &salt, PBKDF2_ITERATIONS);
+    format!("pbkdf2-sha256${PBKDF2_ITERATIONS}${}${}", BASE64.encode(&salt), BASE64.encode(&h))
+}
+
+fn verify_password(password: &str, stored: &str) -> bool {
+    use data_encoding::BASE64;
+    let parts: Vec<&str> = stored.split('$').collect();
+    let [_, iterations, salt, h] = parts[..] else { return false };
+    let (Ok(iterations), Ok(salt), Ok(h)) = (iterations.parse(), BASE64.decode(salt.as_bytes()), BASE64.decode(h.as_bytes())) else {
+        return false;
+    };
+    let n = std::num::NonZeroU32::new(iterations).unwrap_or(std::num::NonZeroU32::MIN);
+    ring::pbkdf2::verify(ring::pbkdf2::PBKDF2_HMAC_SHA256, n, &salt, password.as_bytes(), &h).is_ok()
+}
+
+/// RFC 6238 TOTP (HMAC-SHA1, 30 s steps, 6 digits) for time `unix_secs`.
+pub fn totp(secret: &[u8], unix_secs: i64) -> u32 {
+    totp_at_step(secret, unix_secs.div_euclid(TOTP_STEP_SECS))
+}
+
+fn totp_at_step(secret: &[u8], step: i64) -> u32 {
+    let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA1_FOR_LEGACY_USE_ONLY, secret);
+    let mac = ring::hmac::sign(&key, &step.to_be_bytes());
+    let m = mac.as_ref();
+    let i = (m[19] & 0x0f) as usize;
+    (u32::from_be_bytes([m[i], m[i + 1], m[i + 2], m[i + 3]]) & 0x7fff_ffff) % 1_000_000
+}
+
+pub struct TotpEnrollment {
+    /// Base32, for typing into an authenticator app.
+    pub secret: String,
+    /// `otpauth://` URL, for a QR code.
+    pub url: String,
+}
+
+/// Sets a user's Dashboard password; their TOTP setting is kept.
+pub async fn set_credentials(state: &AppState, name: &str, password: &str) -> Result<(), Error> {
+    if password.chars().count() < 8 {
+        return Err(Error::BadRequest("password must be at least 8 characters".into()));
+    }
+    let set = sqlx::query("UPDATE users SET password_hash = $2 WHERE name = $1")
+        .bind(name)
+        .bind(hash_password(password))
+        .execute(&state.db)
+        .await?;
+    if set.rows_affected() == 0 {
+        return Err(Error::NotFound);
+    }
+    Ok(())
+}
+
+/// A fresh TOTP secret for `user` to scan; nothing is stored until `turn_on_totp` confirms it.
+pub fn new_totp(user: &User) -> TotpEnrollment {
+    let secret = data_encoding::BASE32_NOPAD.encode(&random::<20>());
+    // `name` is URL-safe (validated in create_user).
+    let url = format!("otpauth://totp/Remote%20CLI:{}?secret={secret}&issuer=Remote%20CLI", user.name);
+    TotpEnrollment { secret, url }
+}
+
+/// Turns TOTP on with a base32 `secret` from `new_totp`, once `code` shows the user's app has it.
+pub async fn turn_on_totp(state: &AppState, user: &User, secret: &str, code: &str) -> Result<(), Error> {
+    let invalid = || Error::BadRequest("the code does not match the secret".into());
+    let secret = data_encoding::BASE32_NOPAD.decode(secret.as_bytes()).map_err(|_| invalid())?;
+    if secret.len() < 16 {
+        return Err(invalid());
+    }
+    let step = state.clock.now().timestamp().div_euclid(TOTP_STEP_SECS);
+    if ![step, step - 1].into_iter().any(|s| code == format!("{:06}", totp_at_step(&secret, s))) {
+        return Err(invalid());
+    }
+    let (stored, sealed) = match &state.config.master_key {
+        Some(key) => (key.seal_bytes(user.id.as_bytes(), &secret)?, true),
+        None => (secret, false),
+    };
+    sqlx::query("UPDATE users SET totp_secret = $2, totp_sealed = $3, totp_last_step = NULL WHERE id = $1")
+        .bind(user.id)
+        .bind(stored)
+        .bind(sealed)
+        .execute(&state.db)
+        .await?;
+    Ok(())
+}
+
+/// Turns TOTP off with a current `code` from the user's app, so a session alone cannot drop it. A wrong code counts
+/// as a failed sign-in, so it cannot be guessed past the lockout.
+pub async fn turn_off_totp(state: &AppState, user: &User, code: &str) -> Result<(), Error> {
+    let (secret, sealed, locked_until): (Option<Vec<u8>>, bool, Option<DateTime<Utc>>) =
+        sqlx::query_as("SELECT totp_secret, totp_sealed, sign_in_locked_until FROM users WHERE id = $1")
+            .bind(user.id)
+            .fetch_one(&state.db)
+            .await?;
+    let Some(secret) = secret else { return Ok(()) };
+    if locked_until.is_some_and(|u| u > state.clock.now()) {
+        return Err(Error::BadRequest("too many wrong codes or passwords; try again later".into()));
+    }
+    if !spend_totp_code(state, user.id, secret, sealed, code).await? {
+        failed(state, user.id).await?;
+        return Err(Error::BadRequest("the code does not match your TOTP secret".into()));
+    }
+    sqlx::query("UPDATE users SET totp_secret = NULL, totp_sealed = FALSE, totp_last_step = NULL WHERE id = $1")
+        .bind(user.id)
+        .execute(&state.db)
+        .await?;
+    Ok(())
+}
+
+pub async fn totp_on(state: &AppState, user: &User) -> anyhow::Result<bool> {
+    Ok(sqlx::query_scalar("SELECT totp_secret IS NOT NULL FROM users WHERE id = $1").bind(user.id).fetch_one(&state.db).await?)
+}
+
+/// Failed sign-ins in a row (wrong password or TOTP code) that lock a user out for `LOCKOUT`.
+pub const MAX_FAILED_SIGN_INS: i32 = 5;
+pub const LOCKOUT: chrono::Duration = chrono::Duration::minutes(15);
+
+pub enum SignInError {
+    /// Wrong name, password or TOTP code (no hint which).
+    Invalid,
+    /// Right password, but the user turned TOTP on and gave no code.
+    TotpRequired,
+    /// Too many failures; no credentials are checked until then.
+    Locked(chrono::DateTime<chrono::Utc>),
+}
+
+/// Checks the password, and the TOTP code if the user turned TOTP on, and opens a session (no hint which part
+/// failed, except that a right password with no code says a code is needed).
+/// A TOTP code is accepted for the current and the previous 30 s step, and each step only once.
+/// `MAX_FAILED_SIGN_INS` failures in a row lock the user out for `LOCKOUT` (by the Server clock).
+// shortcut: counted per user only, unknown names are not tracked; add a per-IP limit if name spraying becomes a problem.
+pub async fn sign_in(
+    state: &AppState,
+    name: &str,
+    password: &str,
+    code: &str,
+) -> anyhow::Result<Result<(User, String), SignInError>> {
+    type Row = (Uuid, Option<String>, Option<Vec<u8>>, bool, Option<chrono::DateTime<chrono::Utc>>);
+    let row: Option<Row> = sqlx::query_as(
+        "SELECT id, password_hash, totp_secret, totp_sealed, sign_in_locked_until FROM users WHERE name = $1 AND disabled_at IS NULL",
+    )
+    .bind(name)
+    .fetch_optional(&state.db)
+    .await?;
+    let (id, Some(stored), secret, sealed, locked_until) = row.unwrap_or_default() else {
+        // Same cost as a real check, so timing does not reveal which names exist.
+        let _ = pbkdf2(password, b"no-such-user-salt", PBKDF2_ITERATIONS);
+        return Ok(Err(SignInError::Invalid));
+    };
+    let now = state.clock.now();
+    if let Some(until) = locked_until.filter(|u| *u > now) {
+        return Ok(Err(SignInError::Locked(until)));
+    }
+    if !verify_password(password, &stored) {
+        return failed(state, id).await;
+    }
+    if let Some(secret) = secret {
+        if code.is_empty() {
+            // Counted like a failure: otherwise this answer would check passwords with no lockout.
+            let _ = failed(state, id).await?;
+            return Ok(Err(SignInError::TotpRequired));
+        }
+        if !spend_totp_code(state, id, secret, sealed, code).await? {
+            return failed(state, id).await;
+        }
+    }
+    sqlx::query("UPDATE users SET failed_sign_ins = 0 WHERE id = $1").bind(id).execute(&state.db).await?;
+    let token = format!("rcli_{}", Uuid::new_v4().simple());
+    sqlx::query(
+        "INSERT INTO api_tokens (id, user_id, token_hash, created_at, expires_at) VALUES ($1, $2, $3, $4, $5)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(id)
+    .bind(hash(&token))
+    .bind(now)
+    .bind(now + SESSION_TTL)
+    .execute(&state.db)
+    .await?;
+    let user = sqlx::query_as::<_, User>(&format!("SELECT {USER_COLS} FROM users WHERE id = $1"))
+        .bind(id)
+        .fetch_one(&state.db)
+        .await?;
+    Ok(Ok((user, token)))
+}
+
+/// Seals TOTP secrets still stored in plaintext (from before the master key was configured).
+pub async fn seal_totp_secrets(db: &sqlx::PgPool, key: &crate::master_key::MasterKey) -> anyhow::Result<()> {
+    let plain: Vec<(Uuid, Vec<u8>)> =
+        sqlx::query_as("SELECT id, totp_secret FROM users WHERE totp_secret IS NOT NULL AND NOT totp_sealed").fetch_all(db).await?;
+    for (id, secret) in plain {
+        sqlx::query("UPDATE users SET totp_secret = $2, totp_sealed = TRUE WHERE id = $1 AND NOT totp_sealed")
+            .bind(id)
+            .bind(key.seal_bytes(id.as_bytes(), &secret)?)
+            .execute(db)
+            .await?;
+    }
+    Ok(())
+}
+
+/// Counts a failed sign-in; the one that reaches `MAX_FAILED_SIGN_INS` starts the lockout (and resets the count).
+/// Whether `code` matches the stored TOTP `secret` of user `id` for the current or the previous 30 s step, that step
+/// not used before; marks the step used.
+async fn spend_totp_code(state: &AppState, id: Uuid, secret: Vec<u8>, sealed: bool, code: &str) -> anyhow::Result<bool> {
+    let secret = match (sealed, &state.config.master_key) {
+        (false, _) => secret,
+        (true, Some(key)) => key.open_bytes(id.as_bytes(), &secret)?,
+        (true, None) => anyhow::bail!("TOTP secrets are sealed: RCLI_MASTER_KEY is required"),
+    };
+    let step = state.clock.now().timestamp().div_euclid(TOTP_STEP_SECS);
+    let Some(step) = [step, step - 1].into_iter().find(|s| code == format!("{:06}", totp_at_step(&secret, *s))) else {
+        return Ok(false);
+    };
+    let fresh = sqlx::query("UPDATE users SET totp_last_step = $2 WHERE id = $1 AND (totp_last_step IS NULL OR totp_last_step < $2)")
+        .bind(id)
+        .bind(step)
+        .execute(&state.db)
+        .await?;
+    Ok(fresh.rows_affected() > 0) // 0: a replayed code
+}
+
+async fn failed(state: &AppState, id: Uuid) -> anyhow::Result<Result<(User, String), SignInError>> {
+    sqlx::query(
+        "UPDATE users SET
+            sign_in_locked_until = CASE WHEN failed_sign_ins + 1 >= $2 THEN $3 END,
+            failed_sign_ins = CASE WHEN failed_sign_ins + 1 >= $2 THEN 0 ELSE failed_sign_ins + 1 END
+         WHERE id = $1",
+    )
+    .bind(id)
+    .bind(MAX_FAILED_SIGN_INS)
+    .bind(state.clock.now() + LOCKOUT)
+    .execute(&state.db)
+    .await?;
+    Ok(Err(SignInError::Invalid))
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn totp_matches_rfc_6238_vectors() {
+        // RFC 6238 appendix B, SHA-1, last 6 of the 8 digits.
+        let secret = b"12345678901234567890";
+        assert_eq!(super::totp(secret, 59), 287082);
+        assert_eq!(super::totp(secret, 1111111109), 81804);
+        assert_eq!(super::totp(secret, 2000000000), 279037);
+    }
+
+    #[test]
+    fn password_hash_round_trips() {
+        let h = super::hash_password("correct horse");
+        assert!(super::verify_password("correct horse", &h));
+        assert!(!super::verify_password("wrong", &h));
+    }
+}

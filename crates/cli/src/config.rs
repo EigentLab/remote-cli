@@ -1,0 +1,461 @@
+//! Controller configuration (ADR 0006): `rcli install` writes the machine-wide part, read-only for every local user
+//! (Server Address, Server Key, pinned update key, API Address). Each user's config directory holds their User
+//! session and Address Book; their remembered Device Passwords live in the OS keychain (Keychain, Credential Manager, Secret
+//! Service), with a `0600` file fallback.
+
+use std::path::{Path, PathBuf};
+
+use rcli_agent::secret_store::SecretStore;
+use serde::{Deserialize, Serialize};
+
+/// `<config dir>/config.json`: this user's own part.
+#[derive(Serialize, Deserialize, Default, Clone)]
+pub struct Config {
+    /// User session from `rcli login` (ticket 05).
+    #[serde(default)]
+    pub session: Option<String>,
+    /// This OS user's Address Book (ADR 0011), in the order Devices were added.
+    #[serde(default)]
+    pub address_book: Vec<Entry>,
+}
+
+/// A Device in the Address Book; its password, when remembered, is in the keychain or the `passwords` store.
+#[derive(Serialize, Deserialize, Clone)]
+pub struct Entry {
+    pub device_id: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    /// The Device's MAC and subnet from the last time it was seen Online, for Wake (ADR 0011).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wake: Option<serde_json::Value>,
+}
+
+/// The machine-wide Controller configuration `rcli install` writes. The Agent keeps `api_address` current.
+#[derive(Serialize, Deserialize, Default, Clone)]
+pub struct Machine {
+    /// The Server Address the Agent dials, host:port.
+    pub server: String,
+    pub server_key: String,
+    /// Where Controllers call the Server; empty until the Server has one.
+    #[serde(default)]
+    pub api_address: String,
+    /// The Server's CA certificate (PEM), checked against the Server Key's fingerprint at registration: the API
+    /// Address may be served with a certificate from it (ADR 0015).
+    #[serde(default)]
+    pub ca_pem: String,
+}
+
+/// The machine-wide configuration file, under `root` instead of `/` for the `--root` test seam.
+pub fn machine_path(root: Option<&Path>) -> PathBuf {
+    // Windows: in the install's state directory (`windows_install::Layout`).
+    #[cfg(windows)]
+    return root.map_or_else(crate::windows_install::Layout::real, crate::windows_install::Layout::under).controller_config();
+    #[cfg(not(windows))]
+    crate::install::at(root.unwrap_or(Path::new("/")), "/etc/rcli/controller.json")
+}
+
+/// A User Mode install's Controller configuration, in its user's config directory (ADR 0012).
+pub const CONTROLLER_FILE: &str = "controller.json";
+
+/// The Controller configuration the user with config directory `dir` uses: their own User Mode one, else the
+/// machine-wide one (under `root` for the `--root` test seam).
+pub fn controller_path(dir: &Path, root: Option<&Path>) -> PathBuf {
+    let own = dir.join(CONTROLLER_FILE);
+    if own.exists() {
+        return own;
+    }
+    machine_path(root)
+}
+
+/// Writes the machine-wide configuration readable by every local user (Windows: `windows_install` sets the ACL).
+pub fn save_machine(path: &Path, machine: &Machine) -> anyhow::Result<()> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    std::fs::write(path, serde_json::to_vec_pretty(machine)?)?;
+    #[cfg(unix)]
+    std::fs::set_permissions(path, std::os::unix::fs::PermissionsExt::from_mode(0o644))?;
+    Ok(())
+}
+
+pub fn load_machine(path: &Path) -> anyhow::Result<Option<Machine>> {
+    match std::fs::read(path) {
+        Ok(bytes) => Ok(Some(serde_json::from_slice(&bytes)?)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// The machine-wide configuration, or the message to install first.
+pub fn installed(path: &Path) -> anyhow::Result<Machine> {
+    load_machine(path)?.ok_or_else(|| {
+        anyhow::anyhow!("rcli is not installed on the Local Device: run `rcli install --server <Server Address> --key <Server Key>`")
+    })
+}
+
+/// Where Controller commands call the Server, or why they cannot yet.
+pub fn api_address(machine: &Machine) -> anyhow::Result<String> {
+    anyhow::ensure!(
+        !machine.api_address.is_empty(),
+        "the Server has no API Address yet: an Admin must open the Dashboard over https:// once (or set it in Server \
+         Settings); the Local Device picks it up when its Agent next connects"
+    );
+    Ok(machine.api_address.clone())
+}
+
+/// The Controller API client of the install whose Controller configuration is `machine` (`rcli_agent::http_client`).
+pub fn http(machine: &Path) -> reqwest::Client {
+    rcli_agent::http_client(&load_machine(machine).ok().flatten().map(|m| m.ca_pem).unwrap_or_default())
+}
+
+/// The platform's per-user config directory; `RCLI_CONFIG_DIR` overrides it (tests).
+pub fn dir() -> PathBuf {
+    if let Some(dir) = std::env::var_os("RCLI_CONFIG_DIR").filter(|d| !d.is_empty()) {
+        return dir.into();
+    }
+    platform_dir()
+}
+
+/// The platform's standard per-user config directory.
+fn platform_dir() -> PathBuf {
+    #[cfg(target_os = "windows")]
+    return std::env::var_os("APPDATA").map(PathBuf::from).unwrap_or_default().join("rcli");
+    #[cfg(target_os = "macos")]
+    return std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default().join("Library/Application Support/rcli");
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
+        .unwrap_or_default()
+        .join("rcli")
+}
+
+pub fn load() -> anyhow::Result<Option<Config>> {
+    load_at(&dir())
+}
+
+pub fn load_at(dir: &Path) -> anyhow::Result<Option<Config>> {
+    match std::fs::read(dir.join("config.json")) {
+        Ok(bytes) => Ok(Some(serde_json::from_slice(&bytes)?)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
+fn save(dir: &Path, config: &Config) -> anyhow::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    let path = dir.join("config.json");
+    std::fs::write(&path, serde_json::to_vec_pretty(config)?)?;
+    // The file holds the User session: private to this user.
+    #[cfg(unix)]
+    std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o600))?;
+    Ok(())
+}
+
+/// Stores (or with `None` clears) the User session from `rcli login` / `rcli logout`.
+pub fn set_session(dir: &Path, session: Option<String>) -> anyhow::Result<Config> {
+    let mut config = load_at(dir)?.unwrap_or_default();
+    config.session = session;
+    save(dir, &config)?;
+    Ok(config)
+}
+
+/// Adds `entry` to the Address Book, or replaces the Device's entry in place (keeping its wake address when `entry`
+/// has none).
+pub fn add_entry(dir: &Path, mut entry: Entry) -> anyhow::Result<()> {
+    let mut config = load_at(dir)?.unwrap_or_default();
+    match config.address_book.iter_mut().find(|e| e.device_id == entry.device_id) {
+        Some(existing) => {
+            entry.wake = entry.wake.or(existing.wake.take());
+            *existing = entry
+        }
+        None => config.address_book.push(entry),
+    }
+    save(dir, &config)
+}
+
+/// Records the MAC and subnet the Server reported for an Online Device in its Address Book entry, if it changed.
+pub fn set_wake(dir: &Path, device: &str, wake: &serde_json::Value) -> anyhow::Result<()> {
+    let mut config = load_at(dir)?.unwrap_or_default();
+    match config.address_book.iter_mut().find(|e| e.device_id == device) {
+        Some(e) if wake.is_object() && e.wake.as_ref() != Some(wake) => e.wake = Some(wake.clone()),
+        _ => return Ok(()),
+    }
+    save(dir, &config)
+}
+
+/// Removes a Device's Address Book entry and its remembered password.
+pub fn forget(dir: &Path, device: &str) -> anyhow::Result<()> {
+    if let Some(mut config) = load_at(dir)? {
+        config.address_book.retain(|e| e.device_id != device);
+        save(dir, &config)?;
+    }
+    forget_password(dir, device)
+}
+
+/// This Controller's name, as the Control Lock holder and the Device show it.
+pub fn hostname() -> String {
+    hostname_or("controller")
+}
+
+/// The local host name with a caller-chosen last resort: the Controller's name above, or the Device name an install
+/// records (`windows_install::device_name`). One probe serves both (S7).
+pub fn hostname_or(fallback: &str) -> String {
+    let env = std::env::var("COMPUTERNAME").or_else(|_| std::env::var("HOSTNAME")).ok();
+    let command = std::process::Command::new("hostname").output().ok().map(|out| String::from_utf8_lossy(&out.stdout).trim().to_owned());
+    hostname_from(env, command, fallback)
+}
+
+/// The probe's decision, split out so the fallbacks are tested without changing this process's environment.
+fn hostname_from(env: Option<String>, command: Option<String>, fallback: &str) -> String {
+    env.filter(|name| !name.trim().is_empty())
+        .or(command.filter(|name| !name.trim().is_empty()))
+        .unwrap_or_else(|| fallback.to_owned())
+}
+
+/// The Server Key's secret and Device Passwords travel in request headers, so the Controller API must be reached over
+/// https (it sits behind a TLS reverse proxy). The one exception is loopback, for a Server on this computer and for
+/// tests: nothing leaves the computer there. There is no flag to accept plain http to another host.
+pub(crate) fn check_transport(base: &str) -> anyhow::Result<()> {
+    let url = reqwest::Url::parse(base).map_err(|e| anyhow::anyhow!("bad Server Address {base}: {e}"))?;
+    let host = url.host_str().unwrap_or_default().trim_matches(['[', ']']);
+    let loopback = host == "localhost" || host.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback());
+    match url.scheme() {
+        "https" => Ok(()),
+        "http" if loopback => Ok(()),
+        "http" => anyhow::bail!(
+            "{base} is plain http: the Server Key and Device Passwords would travel unencrypted. Use the https:// \
+             address of your TLS reverse proxy"
+        ),
+        other => anyhow::bail!("the Server Address must start with https:// (not {other}://)"),
+    }
+}
+
+/// A remembered Device Password and the Controller's name it was saved with.
+#[derive(Serialize, Deserialize)]
+pub struct Remembered {
+    pub password: String,
+    pub controller: String,
+}
+
+/// Remembered Device Passwords by Device ID, under `<config dir>/passwords` (0600 files). Each holds the password
+/// itself, or `IN_KEYCHAIN` when the OS keychain took it, so the Device IDs stay listable either way.
+fn password_store(dir: &Path) -> rcli_agent::secret_store::FileSecretStore {
+    rcli_agent::secret_store::FileSecretStore::new(dir.join("passwords"))
+}
+
+const IN_KEYCHAIN: &str = "keychain";
+
+/// The OS keychain (macOS Keychain, Windows Credential Manager, Linux Secret Service), used for the platform's own
+/// config directory. A config directory chosen with `--config-dir` / `RCLI_CONFIG_DIR` (tests, portable setups)
+/// keeps everything in it.
+// The Linux Secret Service needs a D-Bus session, which a headless Controller or a cron job lacks: `remember`
+// falls back to the 0600 file when `set` fails, so such a Controller keeps working without a keychain.
+#[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+mod keychain {
+    fn entry(device: &str) -> keyring::Result<keyring::Entry> {
+        keyring::Entry::new("rcli", device)
+    }
+
+    pub fn set(device: &str, value: &str) -> anyhow::Result<()> {
+        Ok(entry(device)?.set_password(value)?)
+    }
+
+    pub fn get(device: &str) -> anyhow::Result<Option<String>> {
+        match entry(device)?.get_password() {
+            Ok(value) => Ok(Some(value)),
+            Err(keyring::Error::NoEntry) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    pub fn remove(device: &str) {
+        let _ = entry(device).and_then(|e| e.delete_credential());
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
+mod keychain {
+    pub fn set(_device: &str, _value: &str) -> anyhow::Result<()> {
+        anyhow::bail!("no OS keychain here")
+    }
+
+    pub fn get(_device: &str) -> anyhow::Result<Option<String>> {
+        Ok(None)
+    }
+
+    pub fn remove(_device: &str) {}
+}
+
+/// A plaintext password file from before the passwords were encrypted; `remember`/`forget` delete it.
+fn legacy_password_path(dir: &Path, device: &str) -> PathBuf {
+    dir.join("passwords").join(format!("{device}.json"))
+}
+
+/// Remembers a Device Password: in the OS keychain for the platform's config directory when it takes it, else in
+/// the 0600 file.
+pub fn remember(dir: &Path, device: &str, password: &str, controller: &str) -> anyhow::Result<()> {
+    let _ = std::fs::remove_file(legacy_password_path(dir, device));
+    let remembered = serde_json::to_string(&Remembered { password: password.into(), controller: controller.into() })?;
+    let in_keychain = dir == platform_dir() && keychain::set(device, &remembered).is_ok();
+    password_store(dir).set(device, if in_keychain { IN_KEYCHAIN } else { &remembered })
+}
+
+fn root_path(dir: &Path, device: &str) -> PathBuf {
+    dir.join("root").join(format!("{device}.json"))
+}
+
+/// Whether `rcli root on <Device ID>` made `--as root` the default for this Device's exec and shell.
+pub fn root_default(dir: &Path, device: &str) -> bool {
+    std::fs::read(root_path(dir, device)).is_ok_and(|b| serde_json::from_slice::<bool>(&b).unwrap_or(false))
+}
+
+pub fn set_root(dir: &Path, device: &str, on: bool) -> anyhow::Result<()> {
+    let path = root_path(dir, device);
+    std::fs::create_dir_all(path.parent().unwrap())?;
+    write_private(&path, &serde_json::to_vec(&on)?)
+}
+
+pub fn remembered(dir: &Path, device: &str) -> anyhow::Result<Option<Remembered>> {
+    let stored = match password_store(dir).get(device)? {
+        // The file only says "in the keychain": a Controller that can no longer reach it (no D-Bus session, a
+        // different account) gets a message naming the keychain, not a bare D-Bus error.
+        Some(stored) if stored == IN_KEYCHAIN => keychain::get(device)
+            .map_err(|e| anyhow::anyhow!("cannot read the remembered Device Password from the OS keychain: {e}"))?,
+        stored => stored,
+    };
+    stored.map(|s| serde_json::from_str(&s)).transpose().map_err(Into::into)
+}
+
+/// Any Device ID with a remembered password (cheapest is fine: the Server scopes the answer anyway).
+pub fn some_remembered(dir: &Path) -> Option<String> {
+    let entries = std::fs::read_dir(dir.join("passwords")).ok()?;
+    entries.flatten().find_map(|e| {
+        let name = e.file_name();
+        name.to_str()?.strip_prefix('.').filter(|n| *n != "secrets.key").map(str::to_owned)
+    })
+}
+
+pub(crate) fn forget_password(dir: &Path, device: &str) -> anyhow::Result<()> {
+    let _ = std::fs::remove_file(legacy_password_path(dir, device));
+    if password_store(dir).get(device)?.as_deref() == Some(IN_KEYCHAIN) {
+        keychain::remove(device);
+    }
+    password_store(dir).remove(device)
+}
+
+fn write_private(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+    use std::io::Write;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut opts, 0o600);
+    opts.open(path)?.write_all(bytes)?;
+    Ok(())
+}
+
+/// Authenticates `req` as a password connection: the Server Key, the Device ID and its Device Password, and the
+/// The Controller's name.
+pub fn password_connection(
+    req: reqwest::RequestBuilder,
+    key: &str,
+    device: &str,
+    password: &str,
+    controller: &str,
+) -> reqwest::RequestBuilder {
+    req.header("x-rcli-server-key", key)
+        .header("x-rcli-device", device)
+        .header("x-rcli-device-password", password)
+        .header("x-rcli-controller", controller)
+}
+
+/// `GET .../devices/{id}` with the password headers: the check `rcli connect` makes before saving; -> the Device.
+pub async fn verify(
+    http: &reqwest::Client,
+    server: &str,
+    key: &str,
+    device: &str,
+    password: &str,
+    controller: &str,
+) -> anyhow::Result<serde_json::Value> {
+    let req = http.get(format!("{}/api/v1/devices/{}", server.trim_end_matches('/'), device));
+    let resp = password_connection(req, key, device, password, controller).send().await?;
+    let status = resp.status();
+    if status.is_success() {
+        return Ok(resp.json().await.unwrap_or_default());
+    }
+    let body: serde_json::Value = resp.json().await.unwrap_or_default();
+    let message = body["error"]["message"].as_str().unwrap_or("unauthorized");
+    // A lockout is not a wrong password: say how long it lasts instead of denying credentials that may be right.
+    if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+        anyhow::bail!("{message}");
+    }
+    anyhow::bail!("the Device ID or Device Password is wrong: {message}")
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn the_server_address_must_be_https_unless_it_is_loopback() {
+        use super::check_transport as ok;
+        assert!(ok("https://server.example.com:8080").is_ok());
+        // Loopback http is the one exception: a Server on this computer, and the tests.
+        for local in ["http://127.0.0.1:8080", "http://localhost:8080", "http://[::1]:8080"] {
+            assert!(ok(local).is_ok(), "{local}");
+        }
+        let err = ok("http://server.example.com:8080").unwrap_err().to_string();
+        assert!(err.contains("TLS reverse proxy"), "{err}");
+        assert!(!err.contains("--insecure-http"), "the flag is gone, so the error cannot offer it: {err}");
+        assert!(ok("ftp://server.example.com").is_err());
+    }
+
+    /// A headless Linux Controller has no Secret Service (no D-Bus session): the call must fail cleanly so
+    /// `remember` takes the 0600 file fallback, never panic or hang. A bogus bus address keeps this from touching a
+    /// real keychain, even when the suite runs on a desktop.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_linux_keychain_without_a_secret_service_fails_cleanly() {
+        let previous = std::env::var_os("DBUS_SESSION_BUS_ADDRESS");
+        std::env::set_var("DBUS_SESSION_BUS_ADDRESS", "unix:path=/nonexistent/rcli-test-bus");
+        let set = super::keychain::set("rcli-test-device", "value");
+        let get = super::keychain::get("rcli-test-device");
+        match previous {
+            Some(address) => std::env::set_var("DBUS_SESSION_BUS_ADDRESS", address),
+            None => std::env::remove_var("DBUS_SESSION_BUS_ADDRESS"),
+        }
+        assert!(set.is_err(), "storing must report the unreachable Secret Service: {set:?}");
+        assert!(get.as_ref().map_or(true, Option::is_none), "reading must not invent a password: {get:?}");
+    }
+
+    #[test]
+    fn one_hostname_probe_falls_back_in_order() {
+        use super::hostname_from as pick;
+        assert_eq!(pick(Some("lab-pc".into()), Some("ignored".into()), "controller"), "lab-pc");
+        assert_eq!(pick(Some("  ".into()), Some("from-command".into()), "controller"), "from-command");
+        assert_eq!(pick(None, Some("  ".into()), "controller"), "controller");
+        assert_eq!(pick(None, None, "windows"), "windows");
+        assert!(!super::hostname().trim().is_empty(), "the Controller always has a name");
+    }
+
+    #[test]
+    fn a_remembered_password_is_encrypted_at_rest_and_round_trips() {
+        let dir = std::env::temp_dir().join(format!("rcli-remembered-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        super::remember(&dir, "123456789", "hunter2xyz", "dev-laptop (10.0.0.5)").unwrap();
+        let raw: Vec<Vec<u8>> = std::fs::read_dir(dir.join("passwords"))
+            .unwrap()
+            .flatten()
+            .map(|e| std::fs::read(e.path()).unwrap())
+            .collect();
+        assert!(raw.iter().all(|b| !b.windows(10).any(|w| w == b"hunter2xyz")), "the password is not stored in plaintext");
+        let remembered = super::remembered(&dir, "123456789").unwrap().unwrap();
+        assert_eq!(remembered.password, "hunter2xyz");
+        assert_eq!(remembered.controller, "dev-laptop (10.0.0.5)");
+        assert_eq!(super::some_remembered(&dir).as_deref(), Some("123456789"));
+        super::forget(&dir, "123456789").unwrap();
+        assert!(super::remembered(&dir, "123456789").unwrap().is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

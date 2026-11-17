@@ -1,0 +1,254 @@
+use rcli_protocol::agent::{server_message, AgentUpdate, ApiAddress};
+use rcli_testkit::{eventually, StatusCode, TestSystem};
+
+#[tokio::test]
+async fn device_reports_its_agent_version() {
+    let sys = TestSystem::start().await;
+    let agent = sys.start_agent("pc-1").await;
+    let d = sys.wait_device(agent.device_id(), |d| !d["agent_version"].is_null()).await;
+    assert_eq!(d["agent_version"], env!("CARGO_PKG_VERSION"));
+    assert!(d.get("update").is_none(), "{d}");
+}
+
+/// A build needs only the file, a semver version and a target: the Server computes its sha256 and size.
+#[tokio::test]
+async fn an_unsigned_build_uploads_and_bad_versions_and_duplicates_are_refused() {
+    let sys = TestSystem::start().await;
+    let (status, body) = sys.api.put_bytes("/api/v1/agent-builds/1.0.0/linux-x86_64", b"bin".to_vec()).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    // printf bin | sha256sum
+    assert_eq!(body["sha256"], "51a1f05af85e342e3c849b47d387086476282d5f50dc240c19216d6edfb1eb5a", "{body}");
+    assert_eq!(body["size"], 3, "{body}");
+
+    let (status, body) = sys.api.put_bytes("/api/v1/agent-builds/latest/linux-x86_64", b"bin".to_vec()).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(body["error"]["message"].as_str().unwrap().contains("semver"), "{body}");
+
+    let (status, body) = sys.api.put_bytes("/api/v1/agent-builds/1.0.0/linux-x86_64", b"other".to_vec()).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(body["error"]["message"].as_str().unwrap().contains("delete the old one first"), "{body}");
+}
+
+/// Agents download builds from the API Address, which a test Server has not learned.
+async fn serve_builds_to_agents(sys: &TestSystem) {
+    sys.rcli(&["api-address", "set", &format!("http://{}", sys.server.http_addr)]).await.unwrap();
+}
+
+/// What an old (signing) Server sends. Its signature field is reserved now, so it decodes and is skipped (see
+/// `rcli_protocol::update`'s test); what is left is installed with no key.
+fn signed_update(version: &str, build: &[u8]) -> AgentUpdate {
+    AgentUpdate {
+        version: version.into(),
+        target: rcli_agent::target(),
+        size: build.len() as u64,
+        sha256: rcli_protocol::update::sha256_hex(build),
+    }
+}
+
+/// During the transition an old Server still sends signed updates: the Agent installs the build, ignoring the signature.
+#[tokio::test]
+async fn an_agent_installs_an_update_with_no_key_pinned() {
+    let sys = TestSystem::start().await;
+    serve_builds_to_agents(&sys).await;
+    let agent = sys.start_agent("pc-1").await;
+    let d = sys.wait_device(agent.device_id(), |d| d["agent_version"] == env!("CARGO_PKG_VERSION")).await;
+    let build = b"new agent binary";
+    sys.upload_build("99.0.0", &rcli_agent::target(), build).await;
+
+    sys.send_agent_update(&d, signed_update("99.0.0", build));
+
+    sys.wait_device(agent.device_id(), |d| d["agent_version"] == "99.0.0").await;
+    assert_eq!(agent.platform.installed_updates(), ["99.0.0"]);
+}
+
+/// Ticket 19: with auto-update switched off at the Device (`rcli agent general auto-update off`), the Agent leaves
+/// an update the Server sends alone.
+#[tokio::test]
+async fn an_agent_with_auto_update_off_does_not_install_an_update() {
+    let sys = TestSystem::start().await;
+    serve_builds_to_agents(&sys).await;
+    let dir = rcli_testkit::temp_dir("rollout-auto-update-off");
+    let agent = sys.start_agent_trusting_socket("pc-1", &dir).await;
+    let d = sys.wait_device(agent.device_id(), |d| d["agent_version"] == env!("CARGO_PKG_VERSION")).await;
+    let build = b"new agent binary";
+    sys.upload_build("99.0.0", &rcli_agent::target(), build).await;
+    sys.agent_rcli(&dir.join("agent.sock"), &["agent", "general", "auto-update", "off"]).await.unwrap();
+
+    sys.send_agent_update(&d, signed_update("99.0.0", build));
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+    assert!(agent.platform.installed_updates().is_empty(), "{:?}", agent.platform.installed_updates());
+}
+
+/// The Agent downloads and installs off its session loop: while an update is under way (held at the install step,
+/// after a build larger than a session frame was downloaded), a command still round-trips and the Device stays Online.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_device_stays_responsive_while_a_large_build_downloads() {
+    let sys = TestSystem::start().await;
+    serve_builds_to_agents(&sys).await;
+    let agent = sys.start_agent("pc-1").await;
+    let d = sys.wait_device(agent.device_id(), |d| d["agent_version"] == env!("CARGO_PKG_VERSION")).await;
+    let build = vec![7u8; 16 << 20];
+    sys.upload_build("99.0.0", &rcli_agent::target(), &build).await;
+    agent.platform.update(|s| s.hold_install = true);
+
+    sys.send_agent_update(&d, signed_update("99.0.0", &build));
+    eventually(|| async {
+        let mut installing = false;
+        agent.platform.update(|s| installing = s.installing);
+        installing.then_some(())
+    })
+    .await;
+    let exec = ["exec", agent.device_id(), "--", "echo", "hi"];
+    let out = tokio::time::timeout(std::time::Duration::from_secs(5), sys.rcli(&exec)).await.expect("the command answers during the update");
+    assert!(out.unwrap().contains("hi"));
+    sys.wait_device(agent.device_id(), |d| d["status"] == "Online").await;
+
+    agent.platform.update(|s| s.hold_install = false);
+    sys.wait_device(agent.device_id(), |d| d["agent_version"] == "99.0.0").await;
+}
+
+/// A Minimum Version above the Agent's own (`CARGO_PKG_VERSION`) and below the 99.0.0 builds these tests upload.
+const ABOVE_THIS_AGENT: &str = "98.0.0";
+
+async fn set_minimum_version(sys: &TestSystem, version: &str) {
+    let (status, body) = sys.api.put_json("/api/v1/server-settings/minimum-version", &serde_json::json!({ "version": version })).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+/// Raising the Minimum Version reaches an Agent already connected: it installs the Latest Build and reconnects with it.
+#[tokio::test]
+async fn an_agent_below_the_minimum_version_updates_itself_to_the_latest_build() {
+    let sys = TestSystem::start().await;
+    serve_builds_to_agents(&sys).await;
+    let agent = sys.start_agent("pc-1").await;
+    let d = sys.wait_device(agent.device_id(), |d| d["agent_version"] == env!("CARGO_PKG_VERSION")).await;
+    assert_eq!(d["needs_update"], false, "{d}");
+    sys.upload_build("99.0.0", &rcli_agent::target(), b"new agent binary").await;
+
+    set_minimum_version(&sys, ABOVE_THIS_AGENT).await;
+
+    let d = sys.wait_device(agent.device_id(), |d| d["agent_version"] == "99.0.0").await;
+    assert_eq!(d["needs_update"], false, "{d}");
+    assert_eq!(agent.platform.installed_updates(), ["99.0.0"]);
+}
+
+/// Below the Minimum Version but the Latest Build is not newer, or at the Minimum Version: no update is sent, even
+/// an hour later. The Device still shows it needs one, in the API and in `rcli devices`.
+#[tokio::test]
+async fn no_agent_update_without_a_newer_build_or_at_the_minimum_version() {
+    let sys = TestSystem::start().await;
+    serve_builds_to_agents(&sys).await;
+    sys.upload_build("0.0.1", &rcli_agent::target(), b"old agent binary").await;
+    set_minimum_version(&sys, ABOVE_THIS_AGENT).await;
+    let agent = sys.start_agent("pc-1").await;
+    sys.wait_device(agent.device_id(), |d| d["agent_version"] == env!("CARGO_PKG_VERSION") && d["needs_update"] == true).await;
+    let dir = rcli_testkit::temp_dir("rollout-needs-update");
+    sys.controller_config(&dir, Some((agent.device_id(), &agent.device_password().unwrap()))).await;
+    let out = sys.rcli_in(&dir, &["devices"]).await.unwrap();
+    assert!(out.contains("update needed"), "{out}");
+
+    set_minimum_version(&sys, env!("CARGO_PKG_VERSION")).await;
+    sys.upload_build("99.0.0", &rcli_agent::target(), b"new agent binary").await;
+    sys.advance(3600);
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+    assert!(agent.platform.installed_updates().is_empty());
+    let d = sys.wait_device(agent.device_id(), |_| true).await;
+    assert_eq!(d["needs_update"], false, "{d}");
+}
+
+/// An Agent below the Minimum Version on connecting gets the Latest Build; a failure (here: no API Address to download
+/// from) is retried after an hour.
+#[tokio::test]
+async fn a_failed_self_update_is_retried_after_an_hour() {
+    rcli_testkit::capture_logs();
+    let sys = TestSystem::start().await;
+    sys.upload_build("99.0.0", &rcli_agent::target(), b"new agent binary").await;
+    set_minimum_version(&sys, ABOVE_THIS_AGENT).await;
+
+    let agent = sys.start_agent("pc-1").await;
+    let d = sys.wait_device(agent.device_id(), |d| d["needs_update"] == true).await;
+    eventually(|| async { rcli_testkit::logged("API Address").then_some(()) }).await;
+
+    // Agents learn the API Address on connecting; hand it to this one without reconnecting, which would retry at once.
+    serve_builds_to_agents(&sys).await;
+    let url = format!("http://{}", sys.server.http_addr);
+    sys.server.state.agents.send(d["id"].as_str().unwrap().parse().unwrap(), server_message::Msg::ApiAddress(ApiAddress { url }));
+    sys.advance(3600);
+    sys.wait_device(agent.device_id(), |d| d["agent_version"] == "99.0.0").await;
+    assert_eq!(agent.platform.installed_updates(), ["99.0.0"]);
+}
+
+/// The version the build lookup for `target` serves (what `rcli update` and Agents get).
+async fn latest_version(sys: &TestSystem, target: &str) -> String {
+    let resp = reqwest::Client::new()
+        .get(format!("http://{}/api/v1/agent-builds/{target}", sys.server.http_addr))
+        .header("x-rcli-server-key", sys.server_key())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    resp.headers()["x-rcli-version"].to_str().unwrap().to_owned()
+}
+
+async fn stored(sys: &TestSystem, build: &[u8]) -> bool {
+    let sha256 = rcli_protocol::update::sha256_hex(build);
+    sys.server.state.storage.get(rcli_server::storage::AGENT_BUILDS, &sha256, None).await.is_ok()
+}
+
+/// The list marks the Latest Build per target; deleting it makes the next-highest version the Latest Build, and a
+/// stored file goes once no build uses it.
+#[tokio::test]
+async fn builds_are_listed_and_deleted_and_the_latest_build_moves_back() {
+    let sys = TestSystem::start().await;
+    sys.upload_build("1.0.0", "linux-x86_64", b"old").await;
+    sys.upload_build("1.1.0", "linux-x86_64", b"new").await;
+    sys.upload_build("1.1.0", "darwin-aarch64", b"old").await;
+
+    let (status, list) = sys.api.get("/api/v1/agent-builds").await;
+    assert_eq!(status, StatusCode::OK, "{list}");
+    let rows: Vec<(&str, &str, bool)> =
+        list.as_array().unwrap().iter().map(|b| (b["version"].as_str().unwrap(), b["target"].as_str().unwrap(), b["latest"] == true)).collect();
+    assert_eq!(rows, [("1.1.0", "darwin-aarch64", true), ("1.1.0", "linux-x86_64", true), ("1.0.0", "linux-x86_64", false)]);
+    let first = &list[0];
+    assert_eq!(first["size"], 3, "{first}");
+    assert_eq!(first["sha256"], rcli_protocol::update::sha256_hex(b"old"), "{first}");
+    assert_eq!(first["uploaded_by"], "admin", "{first}");
+    assert!(first["uploaded_at"].is_string(), "{first}");
+    // Any build, not only the Latest, downloads.
+    let (status, bytes) = sys.api.get_bytes("/api/v1/agent-builds/1.0.0/linux-x86_64").await;
+    assert_eq!((status, bytes.as_ref()), (StatusCode::OK, b"old".as_ref()));
+
+    let (status, body) = sys.api.delete("/api/v1/agent-builds/1.1.0/linux-x86_64").await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    assert_eq!(latest_version(&sys, "linux-x86_64").await, "1.0.0");
+    assert!(!stored(&sys, b"new").await);
+
+    let (status, body) = sys.api.delete("/api/v1/agent-builds/1.1.0").await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    let (_, list) = sys.api.get("/api/v1/agent-builds").await;
+    assert_eq!(list.as_array().unwrap().len(), 1, "{list}");
+    assert_eq!(list[0]["latest"], true, "{list}");
+    assert!(stored(&sys, b"old").await, "1.0.0 still uses it");
+
+    let (status, _) = sys.api.delete("/api/v1/agent-builds/1.1.0").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+/// A release script publishes, lists and withdraws builds with the CLI alone.
+#[tokio::test]
+async fn the_cli_uploads_lists_and_deletes_builds() {
+    let sys = TestSystem::start().await;
+    let file = rcli_testkit::temp_dir("cli-build").join("rcli");
+    std::fs::write(&file, b"cli build").unwrap();
+
+    let out = sys.rcli(&["build", "upload", file.to_str().unwrap(), "--version", "2.0.0", "--target", "linux-x86_64"]).await.unwrap();
+    assert!(out.contains("2.0.0"), "{out}");
+    let out = sys.rcli(&["build", "list"]).await.unwrap();
+    assert!(out.contains("2.0.0") && out.contains("linux-x86_64") && out.contains("latest"), "{out}");
+
+    sys.rcli(&["build", "delete", "2.0.0", "linux-x86_64"]).await.unwrap();
+    let (_, list) = sys.api.get("/api/v1/agent-builds").await;
+    assert_eq!(list, serde_json::json!([]));
+}

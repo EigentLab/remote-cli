@@ -1,0 +1,199 @@
+import { headers } from "next/headers";
+import { api, type ServerSettings } from "@/lib/api";
+import { card, cardHead, title } from "../styles";
+import { CopyButton } from "./copy-button";
+import { HttpWarning } from "./http-warning";
+
+/** One copyable command or value. */
+function CopyRow({ label, value }: { label?: string; value: string }) {
+  return (
+    <div className="grid gap-1.5">
+      {label && <p className="text-sm font-medium">{label}</p>}
+      <div className="flex items-start justify-between gap-3">
+        <code className="min-w-0 bg-muted px-2 py-1.5 text-xs break-all">{value}</code>
+        <CopyButton value={value} />
+      </div>
+    </div>
+  );
+}
+
+/** The Connect guide (ticket 18): everything a new install or Controller needs. */
+export default async function ConnectGuidePage() {
+  const settings = await api<ServerSettings>("/api/v1/server-settings");
+  const h = await headers();
+  const proto = (h.get("x-forwarded-proto") ?? "http").split(",")[0].trim();
+  const host = (h.get("x-forwarded-host") ?? h.get("host") ?? "localhost").split(",")[0].trim();
+  const origin = `${proto}://${host}`;
+  const key = settings.server_key;
+  const server = settings.server_address.split(",")[0].trim();
+  // ADR 0015: a certificate from the Server's CA is not in the system's store, so the command hands the CA to curl.
+  // PEM lines hold no single quote, so each goes in one.
+  const ca = settings.https_ca_pem;
+  const curl = ca
+    ? `printf '%s\\n' ${ca.trim().split("\n").map((line) => `'${line.trim()}'`).join(" ")} > rcli-ca.pem && curl -fsSL --cacert rcli-ca.pem`
+    : "curl -fsSL";
+
+  return (
+    <>
+      <h2 className="mb-5 max-w-none border-b-2 border-ink pb-4 text-3xl font-extrabold tracking-tight">Hướng dẫn kết nối</h2>
+      <HttpWarning claimedHttps={proto === "https"} />
+
+      <div className="grid items-start gap-5 lg:grid-cols-2">
+        <section className={card} aria-label="Server Address">
+          <div className={cardHead}>
+            <h3 className={title}>Server Address</h3>
+          </div>
+          <div className="grid gap-3 p-5 text-sm">
+            <CopyRow value={settings.server_address} />
+            <p className="text-muted-foreground">Tên Server mà Agent và Controller dùng để kết nối.</p>
+          </div>
+        </section>
+
+        <section className={card} aria-label="Server Key">
+          <div className={cardHead}>
+            <h3 className={title}>Server Key</h3>
+          </div>
+          <div className="grid gap-3 p-5 text-sm">
+            <CopyRow value={key} />
+            <p className="text-muted-foreground">
+              Bí mật mọi Agent và Controller cần để kết nối Server. Device mới chỉ cần Server Address và Server Key này.
+            </p>
+          </div>
+        </section>
+      </div>
+
+      <div className="mt-5 grid items-start gap-5">
+        <section className={card} aria-label="Cài đặt rcli">
+          <div className={cardHead}>
+            <h3 className={title}>Cài đặt rcli</h3>
+          </div>
+          <div className="grid gap-3 p-5 text-sm">
+            <p className="text-muted-foreground">
+              Chạy trên mỗi máy: script tải <code className="bg-muted px-1 text-xs">rcli</code>, cài dịch vụ nền và in Device
+              ID cùng Device Password. Máy đó thành một Device và điều khiển được các Device khác ngay.
+            </p>
+            <CopyRow label="Linux / macOS (curl)" value={`${curl} ${origin}/install.sh | sudo sh -s -- --key ${key}`} />
+            {ca ? (
+              // PowerShell has no per-command CA: the browser downloads the binary instead of an unverified script.
+              <div className="grid gap-1.5">
+                <p className="text-sm font-medium">Windows</p>
+                <p className="text-muted-foreground">
+                  Tải{" "}
+                  <a className="font-extrabold text-foreground underline underline-offset-4 hover:text-primary" href="/download/windows/x86_64">
+                    rcli.exe
+                  </a>{" "}
+                  trong trình duyệt rồi mở nó, nhập Server Address và Server Key ở trên.
+                </p>
+              </div>
+            ) : (
+              <CopyRow label="Windows (PowerShell)" value={`iwr ${origin}/install.ps1 -OutFile install.ps1; .\\install.ps1 -Key ${key}`} />
+            )}
+          </div>
+        </section>
+
+        <section className={card} aria-label="Tải xuống">
+          <div className={cardHead}>
+            <h3 className={title}>Tải xuống</h3>
+          </div>
+          <div className="grid gap-3 p-5 text-sm">
+            {/* The exe is the rolled-out build itself (it installs itself); the packages are what an Admin uploaded
+                with `rcli package publish`. */}
+            <ul className="grid gap-1.5">
+              <li>
+                <a className="font-extrabold text-foreground underline underline-offset-4 hover:text-primary" href="/download/windows/x86_64">
+                  rcli.exe
+                </a>{" "}
+                <span className="ml-2 text-muted-foreground">Windows</span>
+              </li>
+              <li>
+                <a className="font-extrabold text-foreground underline underline-offset-4 hover:text-primary" href="/download/package/dmg/aarch64">
+                  rcli.dmg
+                </a>{" "}
+                <span className="ml-2 text-muted-foreground">macOS (Apple silicon)</span>
+              </li>
+              <li>
+                <a className="font-extrabold text-foreground underline underline-offset-4 hover:text-primary" href="/download/package/deb/x86_64">
+                  rcli.deb
+                </a>{" "}
+                <span className="ml-2 text-muted-foreground">Debian/Ubuntu</span>
+              </li>
+              <li>
+                <a className="font-extrabold text-foreground underline underline-offset-4 hover:text-primary" href="/download/package/rpm/x86_64">
+                  rcli.rpm
+                </a>{" "}
+                <span className="ml-2 text-muted-foreground">Fedora/RHEL</span>
+              </li>
+            </ul>
+            <p className="text-muted-foreground">
+              Bản dựng chưa ký, nên Windows và macOS hiện cảnh báo khi mở: xem mục cuối trang.
+            </p>
+          </div>
+        </section>
+
+        <section className={card} aria-label="Cài đặt không giao diện">
+          <div className={cardHead}>
+            <h3 className={title}>Cài đặt không giao diện</h3>
+          </div>
+          <div className="grid gap-3 p-5 text-sm">
+            <p className="text-muted-foreground">
+              Trên Device không có màn hình (headless): tải <code className="bg-muted px-1 text-xs">rcli</code> cho đúng hệ điều hành ở
+              trên, rồi chạy:
+            </p>
+            <CopyRow value={`sudo rcli install --server ${server} --key ${key}`} />
+          </div>
+        </section>
+
+        <section className={card} aria-label="Kết nối Device">
+          <div className={cardHead}>
+            <h3 className={title}>Kết nối Device</h3>
+          </div>
+          <div className="grid gap-3 p-5 text-sm">
+            <p className="text-muted-foreground">
+              Trên máy đã cài, kết nối Device khác bằng Device ID và Device Password của nó (hiện ở Device đó qua{" "}
+              <code className="bg-muted px-1 text-xs">rcli agent info</code>):
+            </p>
+            <CopyRow value="rcli connect <Device ID>" />
+          </div>
+        </section>
+
+        <section className={card} aria-label="MCP cho Claude Code">
+          <div className={cardHead}>
+            <h3 className={title}>MCP cho Claude Code</h3>
+          </div>
+          <div className="grid gap-3 p-5 text-sm">
+            <p className="text-muted-foreground">
+              Sau khi <code className="bg-muted px-1 text-xs">rcli connect</code>, thêm <code className="bg-muted px-1 text-xs">rcli</code>{" "}
+              làm MCP server (dùng cùng cấu hình và Device Password đã nhớ):
+            </p>
+            <CopyRow value="claude mcp add rcli -- rcli mcp" />
+          </div>
+        </section>
+
+        <section className={card} aria-label="SmartScreen và Gatekeeper">
+          <div className={cardHead}>
+            <h3 className={title}>SmartScreen và Gatekeeper</h3>
+          </div>
+          <div className="grid gap-3 p-5 text-sm">
+            <p className="text-muted-foreground">
+              Bản dựng chưa code-sign, nên hai hệ điều hành hiện cảnh báo khi mở lần đầu:
+            </p>
+            <p>
+              <strong className="font-extrabold text-foreground">Windows (SmartScreen):</strong>{" "}
+              <span className="text-muted-foreground">
+                khi mở <code className="bg-muted px-1 text-xs">rcli.exe</code>, Windows hiện &quot;Windows protected your
+                PC&quot;: bấm <em>More info</em> rồi <em>Run anyway</em>.
+              </span>
+            </p>
+            <p>
+              <strong className="font-extrabold text-foreground">macOS (Gatekeeper):</strong>{" "}
+              <span className="text-muted-foreground">
+                bấm chuột phải vào app rồi chọn <em>Mở</em> (Open). Nếu vẫn bị chặn, gỡ cờ cách ly:{" "}
+                <code className="bg-muted px-1 text-xs">xattr -d com.apple.quarantine {"<đường dẫn>"}</code>.
+              </span>
+            </p>
+          </div>
+        </section>
+      </div>
+    </>
+  );
+}

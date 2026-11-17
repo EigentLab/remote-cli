@@ -1,0 +1,57 @@
+/* The Dashboard's design system (dashboard/app/tokens.css) on Starlight's theme variables.
+   Unlayered, so it wins over Starlight's @layer starlight.* rules. */
+:root {
+	--sl-font: 'Chivo Mono', ui-monospace, monospace;
+	--sl-font-mono: 'Chivo Mono', ui-monospace, monospace;
+
+	/* Dark: ink ground, paper text. */
+	--sl-color-white: oklch(99.5% 0.005 250);
+	--sl-color-gray-1: oklch(95.5% 0.006 250);
+	--sl-color-gray-2: oklch(80% 0.011 250);
+	--sl-color-gray-3: oklch(62% 0.013 255);
+	--sl-color-gray-4: oklch(47% 0.016 260);
+	--sl-color-gray-5: oklch(34% 0.014 262);
+	--sl-color-gray-6: oklch(21% 0.014 262);
+	--sl-color-black: oklch(16% 0.014 262);
+	--sl-color-accent-low: oklch(28% 0.1 264);
+	--sl-color-accent: oklch(62% 0.2 264);
+	--sl-color-accent-high: oklch(85% 0.08 264);
+}
+
+:root[data-theme='light'] {
+	/* Light: paper ground, ink text, cobalt signal. */
+	--sl-color-white: oklch(16% 0.014 262);
+	--sl-color-gray-1: oklch(29% 0.014 262);
+	--sl-color-gray-2: oklch(29% 0.014 262);
+	--sl-color-gray-3: oklch(47% 0.016 260);
+	--sl-color-gray-4: oklch(62% 0.013 255);
+	--sl-color-gray-5: oklch(80% 0.011 250);
+	--sl-color-gray-6: oklch(91% 0.009 250);
+	--sl-color-gray-7: oklch(95.5% 0.006 250);
+	--sl-color-black: oklch(95.5% 0.006 250);
+	--sl-color-accent-low: oklch(90% 0.05 264);
+	--sl-color-accent: oklch(51% 0.22 264);
+	--sl-color-accent-high: oklch(40% 0.2 264);
+	--sl-color-text-invert: oklch(99.5% 0.003 250);
+}
+
+/* Square corners everywhere, as in the Dashboard (--radius-card: 0). */
+*,
+*::before,
+*::after {
+	border-radius: 0 !important;
+}
+
+h1,
+h2,
+h3,
+h4,
+h5 {
+	font-weight: 800;
+	letter-spacing: -0.03em;
+}
+
+::selection {
+	background: oklch(81% 0.16 82);
+	color: oklch(16% 0.014 262);
+}

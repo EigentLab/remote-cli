@@ -1,0 +1,10 @@
+# Private to the dev repo: left out of `git archive`, so out of the public snapshot and the release and deploy archives.
+/.scratch export-ignore
+/docs/research export-ignore
+/docs/agents export-ignore
+/AGENTS.md export-ignore
+/dashboard/.hallmark export-ignore
+/dashboard/design.md export-ignore
+/crates/cli/design.md export-ignore
+/scripts/publish-snapshot.sh export-ignore
+/scripts/publish-snapshot-test.sh export-ignore

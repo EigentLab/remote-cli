@@ -1,0 +1,38 @@
+import { expect, test } from "@playwright/test";
+import { newUser, signIn } from "./devstack";
+
+// alpha is at its lock screen with user "an" logged in: an operator's shell runs as that user. No Control Lock needed.
+test("open a web terminal and run a command", async ({ page }) => {
+  await signIn(page, await newUser());
+  await page.getByRole("link", { name: "alpha" }).click();
+  await page.getByRole("link", { name: "Terminal" }).click();
+
+  const term = page.getByRole("region", { name: "Terminal" });
+  await expect(term.getByLabel("as root")).toBeVisible(); // the Device's root setting decides, not the role (ADR 0004)
+  await term.getByRole("button", { name: "Mở terminal" }).click();
+  await expect(term.getByText("chạy dưới: user")).toBeVisible();
+  const screen = term.locator(".xterm-rows");
+  await expect(screen).toContainText("$");
+
+  await term.locator(".xterm").click();
+  await page.keyboard.type("echo hi-from-web");
+  await page.keyboard.press("Enter");
+  await expect(screen).toContainText(/hi-from-web\s*\$/);
+
+  await page.keyboard.type("exit 3");
+  await page.keyboard.press("Enter");
+  await expect(term.getByText("Phiên đã kết thúc (exit 3)")).toBeVisible();
+});
+
+// An operator may ask for root; the Device decides (ADR 0004). alpha keeps the default `ask` and sits at its lock
+// screen, so nobody can accept and the Device refuses.
+test("the Device, not the role, decides root in the web terminal", async ({ page }) => {
+  await signIn(page, await newUser());
+  await page.getByRole("link", { name: "alpha" }).click();
+  await page.getByRole("link", { name: "Terminal" }).click();
+
+  const term = page.getByRole("region", { name: "Terminal" });
+  await term.getByLabel("as root").check();
+  await term.getByRole("button", { name: "Mở terminal" }).click();
+  await expect(term.getByText(/Không mở được: root access needs a person at the Device/)).toBeVisible();
+});

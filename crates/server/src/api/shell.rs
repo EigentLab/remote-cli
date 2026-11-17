@@ -1,0 +1,189 @@
+//! Interactive shell (PTY) sessions. No Control Lock: only input Actions are exclusive.
+//!
+//! `POST /devices/{d}/shell` answers with an NDJSON stream: `{"session","as"}`, then `{"output": base64}` lines,
+//! then `{"exit_code": n}` (or `{"error": {...}}` if the Device disconnects or the Controller reads too slowly). Closing the stream ends the session.
+//! Keystrokes and terminal size go to `POST /shell-sessions/{id}/input` (raw bytes) and `.../resize`.
+
+use std::convert::Infallible;
+
+use axum::{
+    body::{Body, Bytes},
+    extract::{rejection::JsonRejection, Path, State},
+    http::{header, StatusCode},
+    response::{IntoResponse, Response},
+    routing::post,
+    Json, Router,
+};
+use base64::Engine;
+use rcli_protocol::agent::{self as proto, agent_message, server_message};
+use serde::Deserialize;
+use serde_json::{json, Value};
+use tokio::sync::mpsc;
+use uuid::Uuid;
+
+use super::{bad_request, devices::resolve_for, ApiError, Caller};
+use crate::{agent_link::PROMPT_BUDGET, control_lock};
+
+pub fn routes() -> Router<super::State> {
+    Router::new()
+        .route("/api/v1/devices/{id}/shell", post(open))
+        .route("/api/v1/shell-sessions/{id}/input", post(input))
+        .route("/api/v1/shell-sessions/{id}/resize", post(resize))
+}
+
+/// `{"as": "root" (the Device's root setting decides; default = its Terminal User), "cols": 80, "rows": 24}`.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OpenBody {
+    #[serde(rename = "as")]
+    account: Option<Account>,
+    cols: Option<u32>,
+    rows: Option<u32>,
+}
+
+#[derive(Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+enum Account {
+    Root,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Size {
+    cols: u32,
+    rows: u32,
+}
+
+
+fn check_size(cols: u32, rows: u32) -> Result<(), ApiError> {
+    match (1..=1000).contains(&cols) && (1..=1000).contains(&rows) {
+        true => Ok(()),
+        false => Err(bad_request("cols and rows must be 1..=1000")),
+    }
+}
+
+async fn open(
+    Caller(user): Caller,
+    State(state): State<super::State>,
+    Path(id): Path<String>,
+    body: Result<Json<Value>, JsonRejection>,
+) -> Result<Response, ApiError> {
+    let device = resolve_for(&user, &state, &id).await?;
+    // Terminal use by the Control Lock holder counts as an Action: restarts their idle timer.
+    control_lock::touch(&state, device, &user).await?;
+    let Json(params) = body.map_err(|e| bad_request(e.body_text()))?;
+    let body: OpenBody = serde_json::from_value(params).map_err(bad_request)?;
+    let (cols, rows) = (body.cols.unwrap_or(80), body.rows.unwrap_or(24));
+    check_size(cols, rows)?;
+    // Server roles no longer gate what runs on a Device: the Device's own settings do (ticket 07).
+    let as_root = body.account == Some(Account::Root);
+    let session = Uuid::new_v4();
+    // Registered before the Agent starts the shell so no output is lost.
+    let mut output = state.shells.open(session, device, user.id);
+    let (requester, controller) = (user.name.clone(), user.controller_display());
+    // The Agent may first show an accept prompt and a root prompt, up to 30 s each.
+    let wait = std::time::Duration::from_secs(10) + 2 * PROMPT_BUDGET;
+    let req = |request_id| {
+        server_message::Msg::ShellOpen(proto::ShellOpen {
+            request_id,
+            session: session.to_string(),
+            as_root,
+            cols,
+            rows,
+            requester: requester.clone(),
+            controller: controller.clone(),
+        })
+    };
+    let opened = match state.agents.request_within(device, wait, req).await {
+        Ok(agent_message::Msg::ShellOpened(r)) => match r.error {
+            Some(e) => Err(super::agent_error(e)),
+            None => Ok(if r.as_root { "root" } else { "user" }),
+        },
+        Ok(_) => Err(anyhow::anyhow!("unexpected reply to ShellOpen").into()),
+        Err(e) => Err(e.into()),
+    };
+    let who = match opened {
+        Ok(who) => who,
+        Err(e) => {
+            state.shells.close(session);
+            return Err(e);
+        }
+    };
+
+    // A task relays Agent output into the response body and notices when the Controller goes away.
+    let (lines, lines_rx) = mpsc::channel::<Bytes>(64);
+    let line = |v: Value| Bytes::from(format!("{v}\n"));
+    let _ = lines.send(line(json!({ "session": session, "as": who }))).await;
+    tokio::spawn(async move {
+        // Whether the Agent must be told to end the shell: it did not end there.
+        let close_at_agent = loop {
+            tokio::select! {
+                _ = lines.closed() => break true,
+                msg = output.recv() => match msg {
+                    Some(agent_message::Msg::ShellOutput(o)) => {
+                        let data = base64::engine::general_purpose::STANDARD.encode(&o.data);
+                        if lines.send(line(json!({ "output": data }))).await.is_err() {
+                            break true;
+                        }
+                    }
+                    Some(agent_message::Msg::ShellExit(e)) => {
+                        let _ = lines.send(line(json!({ "exit_code": e.exit_code }))).await;
+                        break false;
+                    }
+                    Some(_) => {}
+                    None if state.shells.overflowed(session) => {
+                        let error = json!({ "code": "controller_too_slow", "hint": rcli_protocol::hint("controller_too_slow"), "message": "output was not read fast enough" });
+                        let _ = lines.send(line(json!({ "error": error }))).await;
+                        // The Server drops a session read too slowly rather than buffer without bound.
+                        break true;
+                    }
+                    None => {
+                        let error = json!({ "code": "device_disconnected", "hint": rcli_protocol::hint("device_disconnected"), "message": "the Device disconnected" });
+                        let _ = lines.send(line(json!({ "error": error }))).await;
+                        break false;
+                    }
+                },
+            }
+        };
+        state.shells.close(session);
+        if close_at_agent {
+            state.agents.send(device, server_message::Msg::ShellClose(proto::ShellClose { session: session.to_string() }));
+        }
+    });
+    let body = futures::stream::unfold(lines_rx, |mut rx| async move { rx.recv().await.map(|b| (Ok::<_, Infallible>(b), rx)) });
+    Ok(([(header::CONTENT_TYPE, "application/x-ndjson")], Body::from_stream(body)).into_response())
+}
+
+/// The Device of the caller's own live session; anyone else's (or an ended) session is 404.
+fn session_device(state: &super::State, id: &str, user: Uuid) -> Result<(Uuid, Uuid), ApiError> {
+    let not_found = || ApiError::new(StatusCode::NOT_FOUND, "not_found", "no such shell session");
+    let session: Uuid = id.parse().map_err(|_| not_found())?;
+    state.shells.device_of(session, user).map(|d| (session, d)).ok_or_else(not_found)
+}
+
+async fn input(
+    Caller(user): Caller,
+    State(state): State<super::State>,
+    Path(id): Path<String>,
+    data: Bytes,
+) -> Result<StatusCode, ApiError> {
+    let (session, device) = session_device(&state, &id, user.id)?;
+    control_lock::touch(&state, device, &user).await?;
+    let msg = proto::ShellInput { session: session.to_string(), data: data.to_vec() };
+    state.agents.send(device, server_message::Msg::ShellInput(msg));
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn resize(
+    Caller(user): Caller,
+    State(state): State<super::State>,
+    Path(id): Path<String>,
+    body: Bytes,
+) -> Result<StatusCode, ApiError> {
+    let (session, device) = session_device(&state, &id, user.id)?;
+    // Any content type: browsers send small fetch bodies as text/plain.
+    let Size { cols, rows } = serde_json::from_slice(&body).map_err(bad_request)?;
+    check_size(cols, rows)?;
+    state.agents.send(device, server_message::Msg::ShellResize(proto::ShellResize { session: session.to_string(), cols, rows }));
+    Ok(StatusCode::NO_CONTENT)
+}
