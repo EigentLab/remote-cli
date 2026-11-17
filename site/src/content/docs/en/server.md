@@ -20,7 +20,7 @@ The same script is in the repo: `https://raw.githubusercontent.com/EigentLab/rem
 The script asks for nothing. It installs Docker with Docker's own script when Docker is missing, writes everything to `/opt/rcli/`, generates every secret into `/opt/rcli/.env`, pulls the Server and Dashboard images of its version from `ghcr.io/eigentlab/`, starts them and creates the first User, `admin`, with a random password. It ends like this:
 
 ```text
-rcli 1.0.0 is running.
+rcli 1.0.1 is running.
 
   Dashboard:       https://203.0.113.10:3443
   CA fingerprint:  4f1c…
@@ -39,7 +39,7 @@ Then:
 
 1. Open the [ports](#ports) it names.
 2. Sign in to the Dashboard as `admin` and change the password on the Users page (or create your own User there and disable `admin`).
-3. Upload the `rcli` files from the [GitHub release](https://github.com/EigentLab/remote-cli/releases) on the Agent updates page (**Cập nhật Agent**). A file named like `rcli-1.0.0-linux-x86_64` fills in the version and target by itself. New Devices download their `rcli` from these Agent Builds, so the install commands on the Connect Guide work only after this step. The `.dmg` and `.deb` packages go up with `rcli package publish` (see [Server administration](/en/usage/#server-administration)).
+3. Upload the `rcli` files from the [GitHub release](https://github.com/EigentLab/remote-cli/releases) on the Agent updates page (**Cập nhật Agent**). A file named like `rcli-1.0.1-linux-x86_64` fills in the version and target by itself. New Devices download their `rcli` from these Agent Builds, so the install commands on the Connect Guide work only after this step. The `.dmg` and `.deb` packages go up with `rcli package publish` (see [Server administration](/en/usage/#server-administration)).
 4. Add Devices: see [Install on a Device](/en/devices/).
 
 ## The five modes
@@ -139,7 +139,7 @@ location / {
 
 ### Switching modes and running it again
 
-Run the command again with another mode to switch: the secrets, the data, the Users and the Devices stay. A run with no argument keeps the installed mode. A second run never regenerates the secrets and never creates a User once one has signed in (the output then says `Users: kept`).
+Run the command again with another mode to switch: the secrets, the data, the Users and the Devices stay, but a switch that moves the Server Address (see below) leaves the installed Agents offline until they are pointed at the new one, and the script says so. A run with no argument keeps the installed mode. A run that refuses its arguments changes nothing. A second run never regenerates the secrets and never creates a User once one has signed in (the output then says `Users: kept`); until then, each run sets `admin`'s password again and prints it.
 
 `--ip` or `--port` alone never switches an installed Server to IP address mode: give both to switch to it. In certificate mode, `--port` alone moves its port. A run that gives another address (another `--ip`, or a switch to or from a domain name) moves the Server Address with it; installed Agents keep the old one until `sudo rcli agent server set <host>:<port> --key <Server Key>` points them at the new one.
 
@@ -257,7 +257,7 @@ As root:
 cd /opt/rcli
 docker compose down -v        # stops rcli and deletes its volumes: the database, the files, the certificates
 cd / && rm -rf /opt/rcli      # the compose files, the proxy files and .env (with the master key)
-docker image rm ghcr.io/eigentlab/remote-cli-server:1.0.0 ghcr.io/eigentlab/remote-cli-dashboard:1.0.0
+docker image rm ghcr.io/eigentlab/remote-cli-server:1.0.1 ghcr.io/eigentlab/remote-cli-dashboard:1.0.1
 ```
 
 Docker stays installed. Close the ports you opened (`sudo ufw delete allow 9443/tcp`, and so on). Devices still installed keep trying to connect: run `rcli uninstall` on each (it warns when the Server is gone and removes the local install anyway).
@@ -270,14 +270,14 @@ Use this when the install script does not fit: another OS or architecture, your 
 
    ```bash
    mkdir rcli && cd rcli
-   curl -fsSLO https://raw.githubusercontent.com/EigentLab/remote-cli/v1.0.0/compose.yaml
+   curl -fsSLO https://raw.githubusercontent.com/EigentLab/remote-cli/v1.0.1/compose.yaml
    ```
 
 2. Write `.env` next to it:
 
    ```bash
    cat > .env <<EOF
-   RCLI_VERSION=1.0.0
+   RCLI_VERSION=1.0.1
    RCLI_BOOTSTRAP_ADMIN_TOKEN=$(openssl rand -hex 16)
    RCLI_MASTER_KEY=$(openssl rand -hex 32)
    RCLI_TURN_SECRET=$(openssl rand -hex 16)

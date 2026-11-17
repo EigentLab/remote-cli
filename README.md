@@ -6,7 +6,7 @@
 <p align="center"><b>Remote control for AI agents and scripts.</b><br>
 <a href="https://rcli.eigentlab.com">Website</a> · <a href="https://rcli.eigentlab.com/en/usage/">Docs</a> · <a href="https://github.com/EigentLab/remote-cli/releases">Download</a> · <a href="README.vi.md">Tiếng Việt</a></p>
 
-rcli lets Claude Code, other AI agents and your scripts see the screen, click, type and run commands on Windows, macOS and Linux machines, through a Server you host. Every Action is one `rcli` command (add `--json` for scripts) or one MCP tool, and each screenshot comes back with its controls numbered, so an agent clicks "Mark 5" or the text "Install now" instead of guessing pixels. People get a Dashboard with Live View and a web terminal on the same Server.
+rcli lets Claude Code, other AI agents and your scripts see the screen, click, type and run commands on Windows, macOS and Linux Devices, through a Server you host. Every Action is one `rcli` command (add `--json` for scripts) or one MCP tool, and each screenshot comes back with its controls numbered, so an agent clicks "Mark 5" or the text "Install now" instead of guessing pixels. People get a Dashboard with Live View and a web terminal on the same Server.
 
 ![The Dashboard's Devices page: an Address Book of seven Devices, five Online](assets/dashboard-devices.png)
 
@@ -24,7 +24,7 @@ rcli lets Claude Code, other AI agents and your scripts see the screen, click, t
 ## How it works
 
 ```text
- AI agent, script, person               your Server                 your machines
+ AI agent, script, person               your Server                 your Devices
  rcli · rcli mcp · Dashboard  ──HTTPS──▶  Controller API  ◀──TLS:9443──  rcli Agent
 ```
 
@@ -87,6 +87,14 @@ claude mcp add rcli -- rcli mcp
 ```
 
 `rcli mcp` uses the install's configuration and the Device Passwords you remembered with `rcli connect`, so it needs no other setup. Its tools are `devices`, `device`, `lock_acquire`, `lock_release`, `lock_status`, `observe`, `act`, `batch`, `exec`, `wake` and `power`; screenshots come back inline with the Mark table. `device: "local"` drives the Local Device. Then ask Claude Code, for example, *"Install the waiting updates on demo-pc."*
+
+## Skill for AI agents
+
+`skills/rcli/` teaches an agent the `rcli` CLI: the rules (Control Lock, secrets, what to ask first), recipes and a command reference. For Claude Code:
+
+```bash
+cp -R skills/rcli ~/.claude/skills/
+```
 
 ## Build from source
 
